@@ -42,6 +42,9 @@ logger = getLogger(__name__)
 #: Bound the backlog. A decompile can enqueue faster than z3 drains, and an
 #: unbounded queue would turn that into unbounded memory.
 DEFAULT_MAX_QUEUE = 512
+#: Native z3 startup is normally sub-millisecond, but a broken native library
+#: must not make rule configuration wait forever.
+DEFAULT_STARTUP_TIMEOUT = 5.0
 
 
 class EscalationProver:
@@ -61,22 +64,71 @@ class EscalationProver:
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue)
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
+        self._ready = threading.Event()
         self._state_lock = threading.RLock()
         self._ctx = None
+        self.startup_error: BaseException | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
-    def start(self) -> None:
+    def start(self, timeout: float | None = DEFAULT_STARTUP_TIMEOUT) -> bool:
+        """Start the worker and wait until its native context is initialized.
+
+        ``Thread.start()`` only means that the worker has been scheduled.  The
+        worker still has to import z3 and construct its private native context
+        before the decompiler can safely continue.  The readiness event makes
+        that boundary explicit.  Missing z3 remains a valid, ready state: the
+        worker can still drain no-op/portable configurations with ``ctx=None``.
+        An unexpected initialization error is published through
+        :attr:`startup_error` and returns ``False`` without leaving a live
+        worker that accepts submissions.
+        """
         with self._state_lock:
             if self._thread is not None:
                 if self._thread.is_alive():
-                    return
+                    thread = self._thread
+                    ready = self._ready
+                else:
+                    self._thread = None
+                    thread = None
+            else:
+                thread = None
+            if thread is None:
+                self._stopping.clear()
+                self._ready.clear()
+                self.startup_error = None
+                self._ctx = None
+                self._thread = threading.Thread(
+                    target=self._run, name="cobra-escalate", daemon=True
+                )
+                thread = self._thread
+                ready = self._ready
+                thread.start()
+
+        if not ready.wait(timeout):
+            with self._state_lock:
+                if self._thread is thread and thread.is_alive():
+                    self.startup_error = TimeoutError(
+                        "cobra escalation worker initialization timed out"
+                    )
+                    self._stopping.set()
+                    self._cancel_queued_locked()
+                    self._queue.put_nowait(None)
+            return False
+
+        with self._state_lock:
+            if self._thread is thread and thread.is_alive() and self.startup_error is None:
+                return True
+            if self._thread is thread and self.startup_error is not None:
+                # The worker publishes the error before returning.  Join the
+                # now-unusable thread so a failed startup cannot leak a live
+                # daemon behind the rule configuration boundary.
+                thread.join()
                 self._thread = None
-            self._stopping.clear()
-            self._thread = threading.Thread(
-                target=self._run, name="cobra-escalate", daemon=True
-            )
-            self._thread.start()
+                return False
+            if self._thread is thread and not thread.is_alive():
+                self._thread = None
+            return False
 
     def _interrupt_context(self) -> None:
         """Ask an in-flight native proof to stop, when supported by z3."""
@@ -157,6 +209,8 @@ class EscalationProver:
             if (
                 self._thread is None
                 or not self._thread.is_alive()
+                or not self._ready.is_set()
+                or self.startup_error is not None
                 or self._stopping.is_set()
             ):
                 return
@@ -180,11 +234,19 @@ class EscalationProver:
         # inside IDA escapes into the Hex-Rays C++ callback as SIGSEGV.
         # Measured: EXIT=139 after two applications.
         try:
-            import z3
+            try:
+                import z3
 
-            self._ctx = z3.Context()
-        except ImportError:
-            self._ctx = None
+                self._ctx = z3.Context()
+            except ImportError:
+                self._ctx = None
+        except Exception as exc:  # noqa: BLE001 - publish startup failure
+            with self._state_lock:
+                self.startup_error = exc
+                self._ready.set()
+            logger.exception("cobra escalation worker initialization failed")
+            return
+        self._ready.set()
         while True:
             item = self._queue.get()
             if item is None:
@@ -230,4 +292,4 @@ class EscalationProver:
         self._table.record_no_rewrite(original, bitwidth)
 
 
-__all__ = ["DEFAULT_MAX_QUEUE", "EscalationProver"]
+__all__ = ["DEFAULT_MAX_QUEUE", "DEFAULT_STARTUP_TIMEOUT", "EscalationProver"]
