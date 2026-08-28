@@ -23,6 +23,9 @@ assuming which matters more.
 
 from __future__ import annotations
 
+import dataclasses
+import uuid
+
 import ida_hexrays
 
 from d810_cobra.convert import ReconstructionError, build_replacement
@@ -49,6 +52,14 @@ from d810_cobra.solve import (
     solve_signature,
 )
 from d810.core import getLogger
+from d810.mba.extension_api import (
+    NativeMbaCandidate,
+    NativeMbaHostServices,
+    PendingMbaProviderObservation,
+)
+from d810.mba.provider_outcome import MbaProviderOutcome, ProviderOutcomeStatus
+from d810.mba.provider_routing import MbaProviderKind
+from d810.mba.typed_term import term_cost, term_fingerprint
 from d810.optimizers.microcode.instructions.peephole.handler import (
     PeepholeSimplificationRule,
 )
@@ -119,6 +130,90 @@ class CobraSolveRule(PeepholeSimplificationRule):
         self._store: ProofCacheStore | None = None
         self._store_loaded = False
         self._unflushed = 0
+        self._mba_host: NativeMbaHostServices | None = None
+        self._pending_observation: PendingMbaProviderObservation | None = None
+
+    def bind_mba_host(self, host: NativeMbaHostServices) -> None:
+        """Bind the IDA-native capture facade once for this rule instance."""
+        if self._mba_host is not None:
+            raise RuntimeError("native MBA host is already bound")
+        self._mba_host = host
+
+    def stop_escalator(self) -> None:
+        """Stop the off-path prover during activation shutdown."""
+        self.escalator.stop()
+
+    def close_store(self) -> None:
+        """Close the durable proof cache after its final flush."""
+        close = getattr(self._store, "close", None)
+        if callable(close):
+            close()
+
+    def _begin_attempt(self, candidate: NativeMbaCandidate) -> None:
+        source = candidate.raw_term if candidate.raw_term is not None else candidate.term
+        cost = term_cost(candidate.term)
+        outcome = MbaProviderOutcome(
+            provider=MbaProviderKind.COEFFICIENT_SOLVER,
+            status=ProviderOutcomeStatus.UNCHANGED,
+            fingerprint=term_fingerprint(candidate.term),
+            input_cost=cost,
+            refusal_reason="pending",
+        )
+        self._pending_observation = PendingMbaProviderObservation(
+            attempt_uuid=str(uuid.uuid4()),
+            raw_term=source,
+            canonical_term=candidate.term,
+            outcome=outcome,
+            candidate_cost=cost,
+        )
+
+    def _finish_attempt(
+        self,
+        status: ProviderOutcomeStatus,
+        reason: str | None = None,
+        *,
+        proof_verdict: bool | None = None,
+    ) -> None:
+        pending = self._pending_observation
+        if pending is None:
+            return
+        outcome = dataclasses.replace(
+            pending.outcome,
+            status=status,
+            refusal_reason=reason,
+            proof_verdict=proof_verdict,
+        )
+        self._pending_observation = dataclasses.replace(pending, outcome=outcome)
+
+    def record_mutation_accepted(self) -> None:
+        pending = self._pending_observation
+        if pending is None or pending.outcome.status is not ProviderOutcomeStatus.IMPROVED:
+            return
+        self._pending_observation = dataclasses.replace(
+            pending,
+            outcome=dataclasses.replace(
+                pending.outcome,
+                status=ProviderOutcomeStatus.APPLIED,
+                refusal_reason=None,
+            ),
+        )
+
+    def record_mutation_rejected(self, reason: str) -> None:
+        pending = self._pending_observation
+        if pending is None or pending.outcome.status is not ProviderOutcomeStatus.IMPROVED:
+            return
+        self._pending_observation = dataclasses.replace(
+            pending,
+            outcome=dataclasses.replace(
+                pending.outcome,
+                refusal_reason=reason or "outer_rejected",
+            ),
+        )
+
+    def pending_provider_observation(self) -> PendingMbaProviderObservation | None:
+        pending = self._pending_observation
+        self._pending_observation = None
+        return pending
 
     def configure(self, kwargs) -> None:
         super().configure(kwargs)
@@ -275,6 +370,7 @@ class CobraSolveRule(PeepholeSimplificationRule):
         try:
             return self._check_and_replace(blk, ins)
         except Exception:  # noqa: BLE001 - see docstring; must not propagate
+            self._finish_attempt(ProviderOutcomeStatus.ERROR, "callback_error")
             logger.exception(
                 "cobra-solve raised at %#x; skipping this instruction",
                 getattr(ins, "ea", 0),
@@ -282,15 +378,20 @@ class CobraSolveRule(PeepholeSimplificationRule):
             return None
 
     def _check_and_replace(self, blk, ins):
-        if not binding_available():
-            return None
+        portable_candidate = None
+        if self._mba_host is not None:
+            portable_candidate = self._mba_host.capture_instruction(ins)
 
         builder = _TreeBuilder()
         try:
             tree = builder.instruction(ins)
         except UnsupportedMicrocode:
+            self._finish_attempt(
+                ProviderOutcomeStatus.INELIGIBLE, "unsupported_microcode"
+            )
             return None
         if tree["kind"] not in ("bin", "un"):
+            self._finish_attempt(ProviderOutcomeStatus.INELIGIBLE, "not_mba")
             return None
 
         names: list[str] = []
@@ -299,16 +400,22 @@ class CobraSolveRule(PeepholeSimplificationRule):
         if not any(o in _BOOL_OPS for o in ops) or not any(
             o in _ARITH_OPS for o in ops
         ):
+            self._finish_attempt(ProviderOutcomeStatus.INELIGIBLE, "not_mba")
             return None
         if not names or len(names) > self.max_leaves:
+            self._finish_attempt(ProviderOutcomeStatus.INELIGIBLE, "leaf_budget")
             return None
 
         dest_size = ins.d.size if ins.d is not None else 0
         if dest_size not in (1, 2, 4, 8):
+            self._finish_attempt(
+                ProviderOutcomeStatus.INELIGIBLE, "unsupported_width"
+            )
             return None
         # Uniform widths only: a leaf narrower than the destination produces
         # mixed operand sizes that IDA's verifier rejects.
         if any(builder.snapshots[n].size != dest_size for n in names):
+            self._finish_attempt(ProviderOutcomeStatus.INELIGIBLE, "mixed_widths")
             return None
 
         candidate = MbaCandidate(
@@ -320,6 +427,15 @@ class CobraSolveRule(PeepholeSimplificationRule):
             dest_size=dest_size,
         )
 
+        if portable_candidate is not None:
+            self._begin_attempt(portable_candidate)
+
+        if not binding_available():
+            self._finish_attempt(
+                ProviderOutcomeStatus.UNAVAILABLE, "solver_unavailable"
+            )
+            return None
+
         # --- tier 1: the table. A hit skips BOTH solving and proving. -------
         self._ensure_store()
         entry = self.table.lookup(candidate.tree, candidate.bitwidth)
@@ -329,6 +445,17 @@ class CobraSolveRule(PeepholeSimplificationRule):
                 # NO_REWRITE: settled, nothing better exists.
                 # PENDING: the escalation prover owns it; asking again this
                 # pass would just re-solve work already in flight.
+                status = (
+                    ProviderOutcomeStatus.OVER_BUDGET
+                    if outcome == Outcome.PENDING.value
+                    else ProviderOutcomeStatus.UNCHANGED
+                )
+                reason = (
+                    "proof_timeout_escalated"
+                    if outcome == Outcome.PENDING.value
+                    else "cached_no_rewrite"
+                )
+                self._finish_attempt(status, reason)
                 return None
             return self._install(candidate, entry.rewrite, ins)
 
@@ -342,13 +469,17 @@ class CobraSolveRule(PeepholeSimplificationRule):
             # every pass; 46 of 60 measured candidates end here.
             self.table.record_no_rewrite(candidate.tree, candidate.bitwidth)
             self._record_and_maybe_flush()
+            if getattr(result.status, "value", None) == SolveStatus.UNCHANGED.value:
+                self._finish_attempt(ProviderOutcomeStatus.UNCHANGED, "no_rewrite")
+            else:
+                self._finish_attempt(ProviderOutcomeStatus.ERROR, "solver_failed")
             return None
-
         # Accept before proving: a rejected rewrite is never used, so proving
         # it first is pure waste.
         if not accept_rewrite(candidate.tree, result.tree):
             self.table.record_no_rewrite(candidate.tree, candidate.bitwidth)
             self._record_and_maybe_flush()
+            self._finish_attempt(ProviderOutcomeStatus.UNCHANGED, "accept_refused")
             return None
 
         if self.require_proof:
@@ -369,6 +500,11 @@ class CobraSolveRule(PeepholeSimplificationRule):
                 )
                 self.table.record_no_rewrite(candidate.tree, candidate.bitwidth)
                 self._record_and_maybe_flush()
+                self._finish_attempt(
+                    ProviderOutcomeStatus.PROOF_FAILED,
+                    "proof_refuted",
+                    proof_verdict=False,
+                )
                 return None
             if value != ProofResult.PROVED.value:
                 # --- tier 3: starved, not disproved. Hand it to the off-path
@@ -380,6 +516,10 @@ class CobraSolveRule(PeepholeSimplificationRule):
                     candidate.bitwidth,
                     result.tree,
                     candidate.leaf_names,
+                )
+                self._finish_attempt(
+                    ProviderOutcomeStatus.OVER_BUDGET,
+                    "proof_timeout_escalated",
                 )
                 return None
 
@@ -396,7 +536,15 @@ class CobraSolveRule(PeepholeSimplificationRule):
                 "cobra-solve applied @ %#x  %d -> %d nodes",
                 ins.ea, candidate.node_count, node_count(rewrite),
             )
+            self._finish_attempt(
+                ProviderOutcomeStatus.IMPROVED,
+                proof_verdict=True if self.require_proof else None,
+            )
             return out
         except ReconstructionError as exc:
             logger.debug("cobra-solve could not rebuild %#x: %s", ins.ea, exc)
+            self._finish_attempt(
+                ProviderOutcomeStatus.RECONSTRUCTION_FAILED,
+                "reconstruction_failed",
+            )
             return None

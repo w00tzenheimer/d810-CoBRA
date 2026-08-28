@@ -13,8 +13,9 @@ coercion.
 
 from __future__ import annotations
 
-import importlib
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import d810_cobra as pkg
 
@@ -31,60 +32,84 @@ class TestManifestShape(unittest.TestCase):
     def test_api_version_is_an_int(self):
         self.assertIsInstance(pkg.MANIFEST["api_version"], int)
 
-    def test_provides_is_a_string_so_d810_resolves_it_lazily(self):
+    def test_provides_is_the_lazy_plugin_target(self):
         """A callable would be resolved eagerly during discovery.
 
         The point of the string form is that an incompatible d810 rejects this
         backend after reading three fields, without importing solve.py and
         therefore without loading the compiled extension.
         """
-        self.assertIsInstance(pkg.MANIFEST["provides"], str)
+        self.assertEqual(pkg.MANIFEST["provides"], "d810_cobra.plugin:PLUGIN")
 
-    def test_declares_its_rule_module(self):
-        """Without this, CobraSolveRule never registers.
-
-        d810 scans ``d810.optimizers.__path__`` for rules, which cannot reach a
-        module inside this package -- the backend would report available while
-        mba-solve was silently absent.
-        """
-        self.assertIn("d810_cobra.rules.cobra_solve", pkg.MANIFEST["rules"])
-
-    def test_rules_is_a_sequence_not_a_bare_string(self):
-        """A bare string would iterate per-character into meaningless imports."""
-        self.assertNotIsInstance(pkg.MANIFEST["rules"], str)
+    def test_manifest_uses_api_one_declaration_without_rules(self):
+        self.assertNotIn("rules", pkg.MANIFEST)
+        self.assertEqual(
+            pkg.MANIFEST["requires"],
+            ("d810.mba.residual-observation.v1",),
+        )
+        self.assertEqual(pkg.MANIFEST["implements"], {"mba-solve": "cobra-solve"})
 
 
-class TestProbeHook(unittest.TestCase):
-    """``provides`` must resolve to a module carrying the probe hook."""
+class TestPluginActivation(unittest.TestCase):
+    def test_plugin_probe_preserves_binding_availability(self):
+        plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
+        with mock.patch("d810_cobra.solve.d810_backend_probe", return_value="missing binding"):
+            self.assertEqual(plugin.PLUGIN.d810_backend_probe(), "missing binding")
 
-    def setUp(self):
-        self.solve = importlib.import_module(pkg.MANIFEST["provides"])
+    def test_plugin_is_resolved_lazily_and_activation_creates_only_cobra_rule(self):
+        plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
+        class FakeRule:
+            pass
 
-    def test_probe_hook_is_callable(self):
-        self.assertTrue(callable(getattr(self.solve, "d810_backend_probe", None)))
+        context = SimpleNamespace(identity="identity", host="host")
+        with mock.patch.object(plugin, "_load_rule_class", return_value=FakeRule), \
+             mock.patch.object(plugin, "_native_host_services", return_value=object()):
+            activation = plugin.PLUGIN.activate(context)
+            first = activation.create_implementation("cobra-solve")
+            second = activation.create_implementation("cobra-solve")
 
-    def test_probe_agrees_with_the_module_flag(self):
-        reason = self.solve.d810_backend_probe()
-        if self.solve.binding_available():
-            self.assertIsNone(reason)
-        else:
-            self.assertIsNotNone(reason)
+        self.assertIsInstance(first, FakeRule)
+        self.assertIsInstance(second, FakeRule)
+        self.assertIsNot(first, second)
+        self.assertEqual(activation.capability_offers(), ())
+        with self.assertRaises(ValueError):
+            activation.create_implementation("other")
 
-    def test_an_absent_binding_names_the_missing_piece(self):
-        """"unavailable" with no reason is the failure the protocol exists to kill.
+    def test_activation_close_is_idempotent_and_continues_after_failures(self):
+        plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
+        calls = []
 
-        Forced rather than left to whether the machine running the suite
-        happens to have built the extension.
-        """
-        from unittest import mock
+        class FakeEscalator:
+            def stop(self):
+                calls.append("stop")
+                raise RuntimeError("stop failed")
 
-        with mock.patch.object(self.solve, "_BINDING_AVAILABLE", False), mock.patch.object(
-            self.solve, "_BINDING_ERROR", "No module named 'd810_cobra._cobra'"
-        ):
-            reason = self.solve.d810_backend_probe()
+        class FakeRule:
+            def __init__(self):
+                self.escalator = FakeEscalator()
 
-        self.assertIsNotNone(reason)
-        self.assertIn("_cobra", reason)
+            def bind_plugin_services(self, services):
+                pass
+
+            def stop_escalator(self):
+                self.escalator.stop()
+
+            def flush_store(self):
+                calls.append("flush")
+
+            def close_store(self):
+                calls.append("close")
+
+        context = SimpleNamespace(identity="identity", host="host")
+        with mock.patch.object(plugin, "_load_rule_class", return_value=FakeRule), \
+             mock.patch.object(plugin, "_native_host_services", return_value=object()):
+            activation = plugin.PLUGIN.activate(context)
+            activation.create_implementation("cobra-solve")
+            activation.create_implementation("cobra-solve")
+            activation.close()
+            activation.close()
+
+        self.assertEqual(calls, ["stop", "flush", "close", "stop", "flush", "close"])
 
 
 if __name__ == "__main__":

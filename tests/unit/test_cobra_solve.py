@@ -8,7 +8,12 @@ feature is off.
 
 from __future__ import annotations
 
+import dataclasses
 import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
 
 from d810_cobra.expr import (
     evaluate,
@@ -18,11 +23,25 @@ from d810_cobra.expr import (
 )
 from d810_cobra.probe import find_cobra_cli
 from d810_cobra.solve import (
+    SolveResult,
     SolveStatus,
     binding_available,
     solve_expression,
     solve_signature,
 )
+
+try:
+    from d810_cobra.rules import cobra_solve
+    from d810_cobra.rules.cobra_solve import CobraSolveRule
+    from d810.mba.extension_api import NativeMbaCandidate
+    from d810.mba.island_profile import profile_typed_term
+    from d810.mba.semantic_canonicalization import canonicalize_mba_term
+    from d810.mba.typed_term import TypedBvTerm
+except ModuleNotFoundError as exc:
+    if exc.name != "ida_hexrays":
+        raise
+    cobra_solve = None
+    CobraSolveRule = None
 
 _MASK32 = 0xFFFFFFFF
 
@@ -132,6 +151,162 @@ class TestBindingCliParity(unittest.TestCase):
                         )
                     if cli.tree is not None:
                         self.assertEqual(evaluate(cli.tree, values, mask), expected)
+
+
+@pytest.mark.skipif(CobraSolveRule is None, reason="IDA runtime is required")
+class TestProviderOutcomePublication:
+    def _rule(self):
+        raw = TypedBvTerm(
+            "sub",
+            32,
+            children=(
+                TypedBvTerm("or", 32, children=(TypedBvTerm(None, 32, leaf_key=("a",)), TypedBvTerm(None, 32, leaf_key=("b",)))),
+                TypedBvTerm("and", 32, children=(TypedBvTerm(None, 32, leaf_key=("a",)), TypedBvTerm(None, 32, leaf_key=("b",)))),
+            ),
+        )
+        canonical = canonicalize_mba_term(raw).canonical_term
+        profile = dataclasses.replace(
+            profile_typed_term(raw),
+            fingerprint=cobra_solve.term_fingerprint(canonical),
+        )
+        candidate = NativeMbaCandidate(
+            destination_size=4,
+            term=canonical,
+            raw_term=raw,
+            profile=profile,
+            native_context=object(),
+        )
+
+        class Host:
+            def capture_instruction(self, _ins):
+                return candidate
+
+        rule = CobraSolveRule()
+        rule.bind_mba_host(Host())
+        rule.require_proof = True
+        rule._ensure_store = lambda: None
+        return rule, SimpleNamespace(ea=0x401000)
+
+    @staticmethod
+    def _builder(*, unsupported=False, non_mba=False):
+        tree = {"kind": "var", "name": "a"} if non_mba else {
+            "kind": "bin",
+            "op": "-",
+            "a": {"kind": "bin", "op": "|", "a": {"kind": "var", "name": "a"}, "b": {"kind": "var", "name": "b"}},
+            "b": {"kind": "bin", "op": "&", "a": {"kind": "var", "name": "a"}, "b": {"kind": "var", "name": "b"}},
+        }
+
+        class Snapshot:
+            size = 4
+
+        class Builder:
+            snapshots = {"a": Snapshot(), "b": Snapshot()}
+
+            def instruction(self, _ins):
+                if unsupported:
+                    raise cobra_solve.UnsupportedMicrocode
+                return tree
+
+        return Builder()
+
+    def _run(self, result, *, accept=True, proof=None):
+        rule, ins = self._rule()
+        ins.d = SimpleNamespace(size=4)
+        proof = proof or cobra_solve.ProofResult.PROVED
+        with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=self._builder()), \
+             mock.patch.object(cobra_solve, "binding_available", return_value=True), \
+             mock.patch.object(cobra_solve, "solve_signature", return_value=result), \
+             mock.patch.object(cobra_solve, "accept_rewrite", return_value=accept), \
+             mock.patch.object(cobra_solve, "prove_equivalent", return_value=proof), \
+             mock.patch.object(cobra_solve, "build_replacement", return_value=object()):
+            replacement = rule.check_and_replace(None, ins)
+        return rule, replacement
+
+    def test_unavailable_solver_is_one_terminal_attempt(self):
+        rule, ins = self._rule()
+        ins.d = SimpleNamespace(size=4)
+        with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=self._builder()), \
+             mock.patch.object(cobra_solve, "binding_available", return_value=False):
+            self.assertIsNone(rule.check_and_replace(None, ins))
+        pending = rule.pending_provider_observation()
+        assert pending is not None
+        assert pending.outcome.status is cobra_solve.ProviderOutcomeStatus.UNAVAILABLE
+        assert pending.outcome.refusal_reason == "solver_unavailable"
+        assert rule.pending_provider_observation() is None
+
+    @pytest.mark.parametrize(
+        ("result", "accept", "proof", "status", "reason"),
+        [
+            (SolveResult(SolveStatus.UNCHANGED), True, None, "unchanged", "no_rewrite"),
+            (SolveResult(SolveStatus.FAILED, reason="boom"), True, None, "error", "solver_failed"),
+            (SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "leaf_0"}), False, None, "unchanged", "accept_refused"),
+            (SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "leaf_0"}), True, "refuted", "proof_failed", "proof_refuted"),
+            (SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "leaf_0"}), True, "unknown", "over_budget", "proof_timeout_escalated"),
+        ],
+    )
+    def test_terminal_gate_is_published_once(self, result, accept, proof, status, reason):
+        rule, _replacement = self._run(
+            result,
+            accept=accept,
+            proof=(getattr(cobra_solve.ProofResult, proof.upper()) if proof else None),
+        )
+        pending = rule.pending_provider_observation()
+        assert pending is not None
+        assert pending.outcome.status.value == status
+        assert pending.outcome.refusal_reason == reason
+        assert rule.pending_provider_observation() is None
+
+    def test_outer_acceptance_upgrades_improved_attempt_to_applied(self):
+        rule, replacement = self._run(
+            SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "leaf_0"}),
+            proof=cobra_solve.ProofResult.PROVED,
+        )
+        assert replacement is not None
+        rule.record_mutation_accepted()
+        pending = rule.pending_provider_observation()
+        assert pending is not None
+        assert pending.outcome.status.value == "applied"
+
+    def test_outer_rejection_retains_improvement_reason(self):
+        rule, replacement = self._run(
+            SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "leaf_0"}),
+            proof=cobra_solve.ProofResult.PROVED,
+        )
+        assert replacement is not None
+        rule.record_mutation_rejected("outer_rejected")
+        pending = rule.pending_provider_observation()
+        assert pending is not None
+        assert pending.outcome.status.value == "improved"
+        assert pending.outcome.refusal_reason == "outer_rejected"
+
+    def test_unsupported_candidate_creates_no_attempt(self):
+        rule, ins = self._rule()
+        ins.d = SimpleNamespace(size=4)
+        with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=self._builder(unsupported=True)), \
+             mock.patch.object(cobra_solve, "binding_available", return_value=False):
+            assert rule.check_and_replace(None, ins) is None
+        assert rule.pending_provider_observation() is None
+
+    def test_non_mba_candidate_creates_no_attempt(self):
+        rule, ins = self._rule()
+        ins.d = SimpleNamespace(size=4)
+        with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=self._builder(non_mba=True)), \
+             mock.patch.object(cobra_solve, "binding_available", return_value=False):
+            assert rule.check_and_replace(None, ins) is None
+        assert rule.pending_provider_observation() is None
+
+    def test_existing_reconstruction_runs_once_without_native_host_prove(self):
+        rule = CobraSolveRule()
+        host = SimpleNamespace(prove=mock.Mock(side_effect=AssertionError("must not call")))
+        rule.bind_mba_host(host)
+        candidate = SimpleNamespace(node_count=3)
+        ins = SimpleNamespace(ea=0x401000)
+        rewrite = {"kind": "var", "name": "a"}
+        expected = object()
+        with mock.patch.object(cobra_solve, "build_replacement", return_value=expected) as build:
+            assert rule._install(candidate, rewrite, ins) is expected
+        build.assert_called_once_with(candidate, rewrite, ins)
+        host.prove.assert_not_called()
 
 
 if __name__ == "__main__":

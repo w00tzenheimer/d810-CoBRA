@@ -38,23 +38,14 @@ from d810_cobra.probe import CobraProbe, CobraStatus, find_cobra_cli
 #: accepts any mapping carrying these three keys.
 #:
 #: ``provides`` is a string, so it is resolved LAZILY -- a version-incompatible
-#: d810 rejects us after reading three fields, without ever importing solve.py
-#: and therefore without loading the compiled extension.
-#: ``rules`` names the optimizer rules we contribute. d810 loads its own rules
-#: by scanning ``d810.optimizers.__path__``, which cannot reach a module inside
-#: this package -- without declaring it here, ``CobraSolveRule`` never
-#: registers and mba-solve is silently absent even though the backend reports
-#: available. d810 imports these only after this backend probes usable, so a
-#: missing binding means no rule rather than a rule that fails on every call.
+#: d810 rejects us after reading three fields, without ever importing the
+#: IDA-coupled rule module.
 MANIFEST = {
     "name": "cobra",
     "api_version": 1,
-    "provides": "d810_cobra.solve",
-    "rules": ("d810_cobra.rules.cobra_solve",),
-    # Which d810 pass our rule implements. d810 derives a pass's
-    # allowed_rule_names from this; without it d810 would have to hardcode
-    # "CobraSolveRule", which is the vendor coupling the extraction removed.
-    "implements": {"mba-solve": "CobraSolveRule"},
+    "provides": "d810_cobra.plugin:PLUGIN",
+    "requires": ("d810.mba.residual-observation.v1",),
+    "implements": {"mba-solve": "cobra-solve"},
 }
 
 __all__ = [
