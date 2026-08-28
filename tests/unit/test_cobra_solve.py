@@ -66,6 +66,13 @@ class TestSignatureOf(unittest.TestCase):
         tree = _tree("-x0", ["a"])
         self.assertEqual(signature_of(tree, ["a"], 8), [0, 0xFF])
 
+    def test_solve_result_accepts_foreign_generation_status_by_value(self):
+        """Reloaded D810/CoBRA enum classes must not require identity matches."""
+        class ForeignStatus:
+            value = SolveStatus.SOLVED.value
+
+        self.assertTrue(SolveResult(ForeignStatus()).solved)
+
 
 @unittest.skipUnless(binding_available(), "CoBRA binding not built")
 class TestSolveSignature(unittest.TestCase):
@@ -230,7 +237,10 @@ class TestProviderOutcomePublication:
             self.assertIsNone(rule.check_and_replace(None, ins))
         pending = rule.pending_provider_observation()
         assert pending is not None
-        assert pending.outcome.status is cobra_solve.ProviderOutcomeStatus.UNAVAILABLE
+        assert (
+            pending.outcome.status.value
+            == cobra_solve.ProviderOutcomeStatus.UNAVAILABLE.value
+        )
         assert pending.outcome.refusal_reason == "solver_unavailable"
         assert rule.pending_provider_observation() is None
 

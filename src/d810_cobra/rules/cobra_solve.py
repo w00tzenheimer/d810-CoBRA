@@ -187,7 +187,10 @@ class CobraSolveRule(PeepholeSimplificationRule):
 
     def record_mutation_accepted(self) -> None:
         pending = self._pending_observation
-        if pending is None or pending.outcome.status is not ProviderOutcomeStatus.IMPROVED:
+        if pending is None or (
+            getattr(pending.outcome.status, "value", None)
+            != ProviderOutcomeStatus.IMPROVED.value
+        ):
             return
         self._pending_observation = dataclasses.replace(
             pending,
@@ -200,7 +203,10 @@ class CobraSolveRule(PeepholeSimplificationRule):
 
     def record_mutation_rejected(self, reason: str) -> None:
         pending = self._pending_observation
-        if pending is None or pending.outcome.status is not ProviderOutcomeStatus.IMPROVED:
+        if pending is None or (
+            getattr(pending.outcome.status, "value", None)
+            != ProviderOutcomeStatus.IMPROVED.value
+        ):
             return
         self._pending_observation = dataclasses.replace(
             pending,

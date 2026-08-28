@@ -15,6 +15,7 @@ without needing z3 or IDA.
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 
 from d810_cobra.escalate import EscalationProver
@@ -26,6 +27,15 @@ B = lambda o, a, b: {"kind": "bin", "op": o, "a": a, "b": b}  # noqa: E731
 
 TREE = B("+", B("&", V("a"), V("b")), B("|", V("a"), V("b")))
 REWRITE = B("+", V("a"), V("b"))
+
+
+def _wait_for_thread_exit(prover: EscalationProver) -> bool:
+    deadline = time.monotonic() + 1
+    while prover._thread is not None and prover._thread.is_alive():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.001)
+    return True
 
 
 class TestEscalationProver(unittest.TestCase):
@@ -142,6 +152,74 @@ class TestEscalationProver(unittest.TestCase):
         prover = EscalationProver(
             self.table, prover=lambda *a, **k: ProofResult.PROVED
         )
+        prover.submit(TREE, 32, REWRITE, ["a", "b"])
+        self.assertIsNone(self.table.lookup(TREE, 32))
+
+    def test_stop_cancels_a_full_queue_without_deadlock(self):
+        """Stopping with one proof in flight must cancel queued work safely."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked(*_args, **_kwargs):
+            started.set()
+            release.wait(5)
+            return ProofResult.PROVED
+
+        prover = EscalationProver(self.table, prover=blocked, max_queue=1)
+        prover.start()
+        prover.submit(TREE, 32, REWRITE, ["a", "b"])
+        self.assertTrue(started.wait(1))
+        other = B("^", V("x"), V("y"))
+        prover.submit(other, 32, B("+", V("x"), V("y")), ["x", "y"])
+
+        stop_done = threading.Event()
+
+        def stop_worker():
+            prover.stop()
+            stop_done.set()
+
+        stopper = threading.Thread(target=stop_worker)
+        stopper.start()
+        self.assertFalse(stop_done.wait(0.1))
+        # The old implementation deadlocks trying to enqueue its sentinel
+        # behind ``other``.  Releasing the proof lets the cooperative stop
+        # complete after it cancels that queued item.
+        release.set()
+        stopper.join(2)
+        self.assertFalse(stopper.is_alive())
+        self.assertIsNone(prover._thread)
+        self.assertEqual(prover._queue.unfinished_tasks, 0)
+
+    def test_timed_stop_retains_live_thread_for_retry(self):
+        """A diagnostic timeout must not discard a still-running worker."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked(*_args, **_kwargs):
+            started.set()
+            release.wait(5)
+            return ProofResult.PROVED
+
+        prover = EscalationProver(self.table, prover=blocked)
+        prover.start()
+        prover.submit(TREE, 32, REWRITE, ["a", "b"])
+        self.assertTrue(started.wait(1))
+        with self.assertRaises(TimeoutError):
+            prover.stop(timeout=0.01)
+        self.assertIsNotNone(prover._thread)
+        self.assertTrue(prover._thread.is_alive())
+        release.set()
+        self.assertTrue(_wait_for_thread_exit(prover))
+        prover.stop()
+        self.assertIsNone(prover._thread)
+        self.assertEqual(prover._queue.unfinished_tasks, 0)
+
+    def test_submit_is_refused_after_stopping(self):
+        prover = EscalationProver(
+            self.table, prover=lambda *a, **k: ProofResult.PROVED
+        )
+        prover.start()
+        prover.stop()
         prover.submit(TREE, 32, REWRITE, ["a", "b"])
         self.assertIsNone(self.table.lookup(TREE, 32))
 

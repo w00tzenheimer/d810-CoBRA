@@ -52,7 +52,7 @@ class SolveResult:
 
     @property
     def solved(self) -> bool:
-        return self.status is SolveStatus.SOLVED
+        return getattr(self.status, "value", None) == SolveStatus.SOLVED.value
 
 
 def binding_available() -> bool:

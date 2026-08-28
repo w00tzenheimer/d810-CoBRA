@@ -61,27 +61,73 @@ class EscalationProver:
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue)
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
+        self._state_lock = threading.RLock()
         self._ctx = None
 
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._stopping.clear()
-        self._thread = threading.Thread(
-            target=self._run, name="cobra-escalate", daemon=True
-        )
-        self._thread.start()
+        with self._state_lock:
+            if self._thread is not None:
+                if self._thread.is_alive():
+                    return
+                self._thread = None
+            self._stopping.clear()
+            self._thread = threading.Thread(
+                target=self._run, name="cobra-escalate", daemon=True
+            )
+            self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
-        """Stop the worker. Safe to call twice, and safe if never started."""
-        if self._thread is None:
-            return
-        self._stopping.set()
-        self._queue.put(None)
-        self._thread.join(timeout)
-        self._thread = None
+    def _interrupt_context(self) -> None:
+        """Ask an in-flight native proof to stop, when supported by z3."""
+        context = self._ctx
+        interrupt = getattr(context, "interrupt", None)
+        if callable(interrupt):
+            try:
+                interrupt()
+            except Exception:  # noqa: BLE001 - shutdown remains best effort
+                logger.debug("cobra escalation context interruption failed", exc_info=True)
+
+    def stop(self, timeout: float | None = None) -> None:
+        """Stop the worker, retaining a live reference after diagnostic timeout.
+
+        The production path waits for the proof worker to exit.  Tests and
+        diagnostics may pass a bounded timeout; in that case a still-live
+        thread raises ``TimeoutError`` and remains owned by this object so a
+        later call can retry.  Queued work is canceled non-blockingly and each
+        canceled item receives its matching ``task_done`` call.
+        """
+        with self._state_lock:
+            thread = self._thread
+            if thread is None:
+                return
+            if not thread.is_alive():
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    else:
+                        self._queue.task_done()
+                self._thread = None
+                return
+            self._stopping.set()
+            self._interrupt_context()
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    self._queue.task_done()
+            # No submitter can pass the state lock after _stopping is set, so
+            # the cancellation above guarantees room for the wakeup sentinel.
+            self._queue.put_nowait(None)
+            thread.join(timeout)
+            if thread.is_alive():
+                raise TimeoutError("cobra escalation worker did not stop")
+            if self._thread is thread:
+                self._thread = None
 
     def drain(self, timeout: float = 30.0) -> None:
         """Block until the queue is empty. For tests and shutdown only."""
@@ -102,17 +148,23 @@ class EscalationProver:
         re-submitting the same candidate on every visit; without it the queue
         grows without bound on a hot expression.
         """
-        if self._thread is None:
-            return
-        entry = self._table.lookup(original, bitwidth)
-        if entry is not None:
-            return
-        self._table.record_pending(original, bitwidth)
-        try:
+        with self._state_lock:
+            if (
+                self._thread is None
+                or not self._thread.is_alive()
+                or self._stopping.is_set()
+            ):
+                return
+            entry = self._table.lookup(original, bitwidth)
+            if entry is not None or self._queue.full():
+                if entry is None and self._queue.full():
+                    logger.debug(
+                        "cobra escalation queue full; dropping %d-leaf candidate",
+                        len(leaf_names),
+                    )
+                return
+            self._table.record_pending(original, bitwidth)
             self._queue.put_nowait((original, bitwidth, rewrite, tuple(leaf_names)))
-        except queue.Full:
-            logger.debug("cobra escalation queue full; dropping %d-leaf candidate",
-                         len(leaf_names))
 
     # -- worker ------------------------------------------------------------
 
@@ -128,7 +180,7 @@ class EscalationProver:
             self._ctx = z3.Context()
         except ImportError:
             self._ctx = None
-        while not self._stopping.is_set():
+        while True:
             item = self._queue.get()
             if item is None:
                 self._queue.task_done()
