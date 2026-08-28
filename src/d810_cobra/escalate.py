@@ -88,6 +88,21 @@ class EscalationProver:
             except Exception:  # noqa: BLE001 - shutdown remains best effort
                 logger.debug("cobra escalation context interruption failed", exc_info=True)
 
+    def _cancel_queued_locked(self) -> None:
+        """Cancel queued items and balance their queue task accounting.
+
+        The caller must hold ``_state_lock``.  In-flight work is owned by the
+        worker and is deliberately left alone; only items still in the queue
+        are removed here.
+        """
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                self._queue.task_done()
+
     def stop(self, timeout: float | None = None) -> None:
         """Stop the worker, retaining a live reference after diagnostic timeout.
 
@@ -100,32 +115,22 @@ class EscalationProver:
         with self._state_lock:
             thread = self._thread
             if thread is None:
+                self._cancel_queued_locked()
                 return
             if not thread.is_alive():
-                while True:
-                    try:
-                        self._queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    else:
-                        self._queue.task_done()
+                self._cancel_queued_locked()
                 self._thread = None
                 return
             self._stopping.set()
             self._interrupt_context()
-            while True:
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    break
-                else:
-                    self._queue.task_done()
+            self._cancel_queued_locked()
             # No submitter can pass the state lock after _stopping is set, so
             # the cancellation above guarantees room for the wakeup sentinel.
             self._queue.put_nowait(None)
             thread.join(timeout)
             if thread.is_alive():
                 raise TimeoutError("cobra escalation worker did not stop")
+            self._cancel_queued_locked()
             if self._thread is thread:
                 self._thread = None
 
@@ -213,6 +218,11 @@ class EscalationProver:
         )
         if getattr(verdict, "value", None) == ProofResult.PROVED.value:
             self._table.record_proved(original, bitwidth, rewrite)
+            return
+        if self._stopping.is_set():
+            # Shutdown interrupts are incomplete proofs, not evidence that a
+            # candidate has no valid rewrite.  Keep the in-flight table entry
+            # PENDING; pending entries are intentionally non-serializable.
             return
         # REFUTED and UNKNOWN both settle to NO_REWRITE. UNKNOWN here means the
         # generous budget also gave up, so re-queueing it every decompile would

@@ -213,6 +213,40 @@ class TestEscalationProver(unittest.TestCase):
         prover.stop()
         self.assertIsNone(prover._thread)
         self.assertEqual(prover._queue.unfinished_tasks, 0)
+        self.assertEqual(prover._queue.qsize(), 0)
+
+        restarted = B("^", V("x"), V("y"))
+        prover.start()
+        prover.submit(restarted, 32, B("+", V("x"), V("y")), ["x", "y"])
+        prover.drain()
+        self.assertEqual(self.table.lookup(restarted, 32).outcome, Outcome.PROVED)
+        prover.stop()
+
+    def test_shutdown_unknown_stays_pending_and_is_not_serialized(self):
+        """A stop interruption must not turn an incomplete proof into NO_REWRITE."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def interrupted(*_args, **_kwargs):
+            started.set()
+            release.wait(5)
+            return ProofResult.UNKNOWN
+
+        prover = EscalationProver(self.table, prover=interrupted)
+        prover.start()
+        prover.submit(TREE, 32, REWRITE, ["a", "b"])
+        self.assertTrue(started.wait(1))
+        stopper = threading.Thread(target=prover.stop)
+        stopper.start()
+        self.assertTrue(prover._stopping.wait(1))
+        release.set()
+        stopper.join(2)
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(self.table.lookup(TREE, 32).outcome, Outcome.PENDING)
+        self.assertFalse(
+            any(entry["outcome"] == Outcome.PENDING.value
+                for entry in self.table.to_dict()["entries"])
+        )
 
     def test_submit_is_refused_after_stopping(self):
         prover = EscalationProver(
@@ -222,6 +256,53 @@ class TestEscalationProver(unittest.TestCase):
         prover.stop()
         prover.submit(TREE, 32, REWRITE, ["a", "b"])
         self.assertIsNone(self.table.lookup(TREE, 32))
+
+    def test_stop_without_thread_cleans_a_stale_sentinel(self):
+        prover = EscalationProver(
+            self.table, prover=lambda *a, **k: ProofResult.PROVED
+        )
+        prover._queue.put(None)
+        prover.stop()
+        self.assertEqual(prover._queue.qsize(), 0)
+        self.assertEqual(prover._queue.unfinished_tasks, 0)
+
+        prover.start()
+        prover.submit(TREE, 32, REWRITE, ["a", "b"])
+        prover.drain()
+        self.assertEqual(self.table.lookup(TREE, 32).outcome, Outcome.PROVED)
+        prover.stop()
+
+    def test_stop_cleans_sentinel_after_worker_dies_during_join(self):
+        """A wakeup dequeued during retry must not leave task accounting stale."""
+
+        class FakeThread:
+            def __init__(self):
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def join(self, timeout=None):
+                self.alive = False
+
+        prover = EscalationProver(
+            self.table, prover=lambda *a, **k: ProofResult.PROVED
+        )
+        fake_thread = FakeThread()
+        prover._thread = fake_thread
+
+        prover.stop()
+
+        self.assertFalse(fake_thread.is_alive())
+        self.assertIsNone(prover._thread)
+        self.assertEqual(prover._queue.qsize(), 0)
+        self.assertEqual(prover._queue.unfinished_tasks, 0)
+
+        prover.start()
+        prover.submit(TREE, 32, REWRITE, ["a", "b"])
+        prover.drain()
+        self.assertEqual(self.table.lookup(TREE, 32).outcome, Outcome.PROVED)
+        prover.stop()
 
 
 if __name__ == "__main__":
