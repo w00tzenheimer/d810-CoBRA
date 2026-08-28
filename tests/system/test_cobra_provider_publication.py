@@ -225,7 +225,7 @@ def test_cobra_gates_publish_through_real_outer_lifecycle(
     proof = ProofResult.PROVED
     solve_result = SolveResult(
         SolveStatus.SOLVED,
-        tree={"kind": "var", "name": "leaf_0"},
+        tree={"kind": "var", "name": "a"},
     )
     binding = True
     accept = True

@@ -234,7 +234,7 @@ class TestProviderOutcomePublication:
         ins.d = SimpleNamespace(size=4)
         with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=self._builder()), \
              mock.patch.object(cobra_solve, "binding_available", return_value=False):
-            self.assertIsNone(rule.check_and_replace(None, ins))
+            assert rule.check_and_replace(None, ins) is None
         pending = rule.pending_provider_observation()
         assert pending is not None
         assert (
@@ -249,9 +249,9 @@ class TestProviderOutcomePublication:
         [
             (SolveResult(SolveStatus.UNCHANGED), True, None, "unchanged", "no_rewrite"),
             (SolveResult(SolveStatus.FAILED, reason="boom"), True, None, "error", "solver_failed"),
-            (SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "leaf_0"}), False, None, "unchanged", "accept_refused"),
-            (SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "leaf_0"}), True, "refuted", "proof_failed", "proof_refuted"),
-            (SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "leaf_0"}), True, "unknown", "over_budget", "proof_timeout_escalated"),
+            (SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "a"}), False, None, "unchanged", "accept_refused"),
+            (SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "a"}), True, "refuted", "proof_failed", "proof_refuted"),
+            (SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "a"}), True, "unknown", "over_budget", "proof_timeout_escalated"),
         ],
     )
     def test_terminal_gate_is_published_once(self, result, accept, proof, status, reason):
@@ -268,7 +268,7 @@ class TestProviderOutcomePublication:
 
     def test_outer_acceptance_upgrades_improved_attempt_to_applied(self):
         rule, replacement = self._run(
-            SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "leaf_0"}),
+            SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "a"}),
             proof=cobra_solve.ProofResult.PROVED,
         )
         assert replacement is not None
@@ -279,7 +279,7 @@ class TestProviderOutcomePublication:
 
     def test_outer_rejection_retains_improvement_reason(self):
         rule, replacement = self._run(
-            SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "leaf_0"}),
+            SolveResult(SolveStatus.SOLVED, tree={"kind": "var", "name": "a"}),
             proof=cobra_solve.ProofResult.PROVED,
         )
         assert replacement is not None

@@ -387,6 +387,10 @@ class CobraSolveRule(PeepholeSimplificationRule):
         portable_candidate = None
         if self._mba_host is not None:
             portable_candidate = self._mba_host.capture_instruction(ins)
+            # The host capture is the publication boundary: host-rejected
+            # inputs (including non-representable width combinations) have no
+            # portable attempt. Once capture succeeds, local representation
+            # gates below publish their terminal refusal instead.
             if portable_candidate is not None:
                 self._begin_attempt(portable_candidate)
 
