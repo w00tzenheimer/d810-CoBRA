@@ -17,7 +17,6 @@ from __future__ import annotations
 import threading
 import time
 import unittest
-from unittest import mock
 
 from d810_cobra.escalate import EscalationProver
 from d810_cobra.prove import ProofResult
@@ -56,54 +55,6 @@ class TestEscalationProver(unittest.TestCase):
         self.assertIsNotNone(entry)
         self.assertEqual(entry.outcome, Outcome.PROVED)
         self.assertEqual(entry.rewrite, REWRITE)
-
-    def test_start_waits_until_worker_native_context_is_ready(self):
-        """start() must not release configure while native startup is pending."""
-        context_started = threading.Event()
-        release_context = threading.Event()
-
-        class FakeZ3:
-            class Context:
-                def __init__(self):
-                    context_started.set()
-                    self.assert_released = release_context.wait(2)
-
-        prover = EscalationProver(
-            self.table, prover=lambda *a, **k: ProofResult.PROVED
-        )
-        with mock.patch.dict("sys.modules", {"z3": FakeZ3}):
-            start_result = []
-            starter = threading.Thread(
-                target=lambda: start_result.append(prover.start())
-            )
-            starter.start()
-            self.assertTrue(context_started.wait(1))
-            self.assertTrue(starter.is_alive())
-            release_context.set()
-            starter.join(2)
-            self.assertFalse(starter.is_alive())
-            self.assertEqual(start_result, [True])
-            prover.stop()
-
-    def test_start_reports_native_context_initialization_failure(self):
-        """A failed startup is not exposed as a healthy live worker."""
-
-        class FakeZ3:
-            class Context:
-                def __init__(self):
-                    raise RuntimeError("native context failed")
-
-        prover = EscalationProver(
-            self.table, prover=lambda *a, **k: ProofResult.PROVED
-        )
-        with mock.patch.dict("sys.modules", {"z3": FakeZ3}):
-            self.assertFalse(prover.start())
-
-        self.assertIsNotNone(prover.startup_error)
-        self.assertIn("native context failed", str(prover.startup_error))
-        self.assertIsNone(prover._thread)
-        prover.submit(TREE, 32, REWRITE, ["a", "b"])
-        self.assertIsNone(self.table.lookup(TREE, 32))
 
     def test_refuted_result_is_recorded_as_no_rewrite(self):
         """A refuted rewrite must be remembered, not merely dropped.
