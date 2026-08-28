@@ -289,12 +289,16 @@ class TestProviderOutcomePublication:
         assert pending.outcome.status.value == "improved"
         assert pending.outcome.refusal_reason == "outer_rejected"
 
-    def test_unsupported_candidate_creates_no_attempt(self):
+    def test_captured_unsupported_candidate_publishes_terminal_attempt(self):
         rule, ins = self._rule()
         ins.d = SimpleNamespace(size=4)
         with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=self._builder(unsupported=True)), \
              mock.patch.object(cobra_solve, "binding_available", return_value=False):
             assert rule.check_and_replace(None, ins) is None
+        pending = rule.pending_provider_observation()
+        assert pending is not None
+        assert pending.outcome.status.value == "ineligible"
+        assert pending.outcome.refusal_reason == "unsupported_microcode"
         assert rule.pending_provider_observation() is None
 
     def test_captured_leaf_budget_refusal_is_published_and_drained(self):
@@ -314,12 +318,26 @@ class TestProviderOutcomePublication:
         assert pending.canonical_term is not None
         assert rule.pending_provider_observation() is None
 
-    def test_non_mba_candidate_creates_no_attempt(self):
+    def test_captured_non_mba_candidate_publishes_terminal_attempt(self):
         rule, ins = self._rule()
         ins.d = SimpleNamespace(size=4)
         with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=self._builder(non_mba=True)), \
              mock.patch.object(cobra_solve, "binding_available", return_value=False):
             assert rule.check_and_replace(None, ins) is None
+        pending = rule.pending_provider_observation()
+        assert pending is not None
+        assert pending.outcome.status.value == "ineligible"
+        assert pending.outcome.refusal_reason == "not_mba"
+        assert rule.pending_provider_observation() is None
+
+    def test_capture_miss_does_not_create_attempt_or_block_local_processing(self):
+        rule, ins = self._rule()
+        ins.d = SimpleNamespace(size=4)
+        with mock.patch.object(rule._mba_host, "capture_instruction", return_value=None), \
+             mock.patch.object(cobra_solve, "_TreeBuilder", return_value=self._builder()), \
+             mock.patch.object(cobra_solve, "binding_available", return_value=False) as available:
+            assert rule.check_and_replace(None, ins) is None
+        available.assert_called_once_with()
         assert rule.pending_provider_observation() is None
 
     def test_existing_reconstruction_runs_once_without_native_host_prove(self):
