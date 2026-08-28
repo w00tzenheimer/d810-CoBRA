@@ -297,6 +297,23 @@ class TestProviderOutcomePublication:
             assert rule.check_and_replace(None, ins) is None
         assert rule.pending_provider_observation() is None
 
+    def test_captured_leaf_budget_refusal_is_published_and_drained(self):
+        """Capture must own the attempt before local eligibility can refuse it."""
+        rule, ins = self._rule()
+        rule.max_leaves = 1
+        ins.d = SimpleNamespace(size=4)
+        with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=self._builder()), \
+             mock.patch.object(cobra_solve, "binding_available", return_value=False):
+            assert rule.check_and_replace(None, ins) is None
+
+        pending = rule.pending_provider_observation()
+        assert pending is not None
+        assert pending.outcome.status.value == "ineligible"
+        assert pending.outcome.refusal_reason == "leaf_budget"
+        assert pending.raw_term is not None
+        assert pending.canonical_term is not None
+        assert rule.pending_provider_observation() is None
+
     def test_non_mba_candidate_creates_no_attempt(self):
         rule, ins = self._rule()
         ins.d = SimpleNamespace(size=4)
