@@ -53,9 +53,9 @@ cobra = "d810_cobra:MANIFEST"
 MANIFEST = {
     "name": "cobra",
     "api_version": 1,
-    "provides": "d810_cobra.solve",
-    "rules": ("d810_cobra.rules.cobra_solve",),
-    "implements": {"mba-solve": "CobraSolveRule"},
+    "provides": "d810_cobra.plugin:PLUGIN",
+    "requires": ("d810.mba.residual-observation.v1",),
+    "implements": {"mba-solve": "cobra-solve"},
 }
 ```
 
@@ -65,26 +65,33 @@ package depends on d810 at runtime, but the *manifest* must not: importing
 clean "backend not discovered" into an ImportError during d810 startup.
 
 Its `provides` is a *string*, resolved lazily, so a version-incompatible d810
-rejects this backend after reading three fields — without importing `solve.py`
-and therefore without loading the compiled extension.
+rejects this backend after reading the manifest — without importing `plugin.py`
+or `solve.py`, and therefore without loading the compiled extension.
 
-`rules` and `implements` are what make the pass actually *run*, and each closes
-a failure that is silent without it:
+The remaining manifest fields describe the explicit API-1 activation contract:
 
-- **`rules`** — d810 registers its own optimizer rules by scanning
-  `d810.optimizers.__path__`. That scan is path-scoped and cannot reach a rule
-  living inside this package. Without declaring it, the backend reports
-  `available` while `CobraSolveRule` never registers — indistinguishable from a
-  pass that ran and matched nothing. d810 imports these only after the backend
-  probes usable, so a missing binding yields no rule rather than a rule that
-  raises on every call.
-- **`implements`** — d810 derives a pass's `allowed_rule_names` from it at
-  registration time, long before rules are imported; a rule outside that
-  allowlist is skipped at dispatch. Declaring it here is what let d810 stop
-  hardcoding `"CobraSolveRule"` in its own source. The key is d810's pass id
-  (`d810.core.pass_ids.PassId.MBA_SOLVE`), written as a plain string so that
-  declaring a manifest still requires no d810 import — `PassId` is a
-  `StrEnum`, so the two compare and hash identically.
+- **`requires`** — the host capability needed by the implementation. d810
+  validates `d810.mba.residual-observation.v1` before activating CoBRA, and
+  passes the resulting host view to the activation and its rule services.
+- **`implements`** — the pass-to-implementation declaration. The value
+  `cobra-solve` is an opaque implementation ID owned by this package; d810
+  does not import or hardcode `CobraSolveRule`.
+
+There is intentionally no `rules` field. d810 discovers the manifest, resolves
+`PLUGIN`, and calls `PLUGIN.activate(PluginActivationContext(...))`. The
+activation creates the implementation only when the selected pass requests
+`create_implementation("cobra-solve")`; that factory may then lazily import
+the IDA-coupled rule. This keeps discovery cheap and makes activation and
+cleanup explicit rather than relying on a package-path scan.
+
+API-1 capability factories, when a backend offers one, are invoked once per
+function with a `PluginFunctionContext` containing the live source, plugin
+function-execution identity (`FunctionExecutionIdentity`), and host capability
+view. They must use that context for function-scoped services such as residual
+observation and must not retain callback-local state across functions or
+reloads. CoBRA's `mba-solve`
+implementation is created through the opaque implementation ID above; it does
+not need a separate capability offer.
 
 d810 itself is a hard dependency (`solve.py` uses `d810.core.getLogger`,
 `table.py` uses `d810.core.cache`, `convert.py`/`detect.py` use
@@ -97,7 +104,7 @@ backends — so this package supplies the `mba-solve` implementation rather than
 overriding one:
 
 ```
-cobra   available   d810-cobra 0.1.0
+cobra   available   d810-cobra 0.1.4
 ```
 
 Check it with `d810cli backends`. Without this package installed, d810's

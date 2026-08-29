@@ -20,10 +20,12 @@ classifiers = [
     "Topic :: Security",
 ]
 
-# d810 IS a hard runtime dependency, including for the entry-point target:
-# solve.py imports d810.core.getLogger, table.py needs d810.core.cache.CacheImpl
-# and d810.core.typing, convert.py/detect.py need d810.hexrays.*. Only `expr`
-# and `probe` are genuinely standalone.
+# d810 IS a hard dependency for activation and runtime use. The entry-point
+# target itself (`d810_cobra:MANIFEST`) is intentionally inert and can be read
+# without importing d810; activation resolves the plugin and then runtime code
+# imports d810.core.getLogger, d810.core.cache.CacheImpl,
+# d810.core.typing, and d810.hexrays.*. Only `expr` and `probe` are genuinely
+# standalone.
 #
 # Not circular: d810 never imports this package, it only discovers it through
 # the entry point.
@@ -33,9 +35,10 @@ classifiers = [
 # break this package without a major version bump on either side.
 #
 # The floor is >=1.0.0b0, NOT >=0.6.6, and the difference is the whole point.
-# Being discovered at all requires d810.core.plugins (BackendRegistry, the
-# manifest protocol) and d810.backends (the `d810.backends` entry-point group
-# plus load_extension_rules). d810-ng 0.6.6 ships NEITHER --
+# Being discovered at all requires d810.core.plugins (BackendRegistry and the
+# API-1 manifest/activation protocol) and d810.backends (the
+# `d810.backends` entry-point group and host-capability binding). d810-ng 0.6.6
+# ships NEITHER --
 #
 #     >>> import d810.core.plugins
 #     ImportError: cannot import name 'plugins' from 'd810.core'
