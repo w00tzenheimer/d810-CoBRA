@@ -8,6 +8,7 @@ by one activation.
 from __future__ import annotations
 
 import builtins
+import threading
 
 from d810.core.plugins import BackendPlugin, PluginActivationContext
 
@@ -47,27 +48,33 @@ class _CobraActivation:
         self._native_host = _native_host_services()
         self._rules: list[object] = []
         self._closed = False
+        self._ownership_lock = threading.RLock()
 
     def create_implementation(self, implementation_id: str) -> object:
         if implementation_id != "cobra-solve":
             raise ValueError(f"unsupported CoBRA implementation: {implementation_id!r}")
-        if self._closed:
-            raise RuntimeError("CoBRA activation is closed")
-        rule = _load_rule_class()()
-        try:
-            bind_host = getattr(rule, "bind_mba_host", None)
-            if callable(bind_host):
-                bind_host(self._native_host)
-        except BaseException as error:
-            cleanup_errors = self._cleanup_rule(rule)
-            if cleanup_errors:
-                raise _BASE_EXCEPTION_GROUP(
-                    "CoBRA implementation construction and cleanup failed",
-                    [error, *cleanup_errors],
-                )
-            raise
-        self._rules.append(rule)
-        return rule
+        binding_error: BaseException | None = None
+        with self._ownership_lock:
+            if self._closed:
+                raise RuntimeError("CoBRA activation is closed")
+            rule = _load_rule_class()()
+            try:
+                bind_host = getattr(rule, "bind_mba_host", None)
+                if callable(bind_host):
+                    bind_host(self._native_host)
+            except BaseException as error:
+                binding_error = error
+            else:
+                self._rules.append(rule)
+                return rule
+
+        cleanup_errors = self._cleanup_rule(rule)
+        if cleanup_errors:
+            raise _BASE_EXCEPTION_GROUP(
+                "CoBRA implementation construction and cleanup failed",
+                [binding_error, *cleanup_errors],
+            )
+        raise binding_error
 
     def capability_offers(self) -> tuple[object, ...]:
         return ()
@@ -91,29 +98,31 @@ class _CobraActivation:
 
     def release_implementation(self, implementation: object) -> None:
         """Release one rule without closing its shared activation."""
-        if self._closed:
-            return
-        for index, rule in enumerate(self._rules):
-            if rule is implementation:
-                del self._rules[index]
-                break
-        else:
-            return
+        with self._ownership_lock:
+            if self._closed:
+                return
+            for index, rule in enumerate(self._rules):
+                if rule is implementation:
+                    del self._rules[index]
+                    break
+            else:
+                return
         errors = self._cleanup_rule(implementation)
         if errors:
             raise _BASE_EXCEPTION_GROUP("CoBRA implementation release failed", errors)
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        rules = tuple(self._rules)
-        self._rules.clear()
+        with self._ownership_lock:
+            if self._closed:
+                return
+            self._closed = True
+            rules = tuple(self._rules)
+            self._rules.clear()
+            self._context = None
+            self._native_host = None
         errors: list[BaseException] = []
         for rule in rules:
             errors.extend(self._cleanup_rule(rule))
-        self._context = None
-        self._native_host = None
         if errors:
             raise _BASE_EXCEPTION_GROUP("CoBRA plugin close failed", errors)
 

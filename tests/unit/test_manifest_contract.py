@@ -14,6 +14,7 @@ coercion.
 from __future__ import annotations
 
 import unittest
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -51,6 +52,144 @@ class TestManifestShape(unittest.TestCase):
 
 
 class TestPluginActivation(unittest.TestCase):
+    def test_concurrent_exact_releases_do_not_orphan_or_double_clean(self):
+        plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
+        cleaned = []
+
+        class FakeRule:
+            def __init__(self, name):
+                self.name = name
+
+            def close_store(self):
+                cleaned.append(self)
+
+        names = iter(("first", "second"))
+        with mock.patch.object(
+            plugin, "_load_rule_class", side_effect=lambda: lambda: FakeRule(next(names))
+        ), mock.patch.object(plugin, "_native_host_services", return_value=object()):
+            activation = plugin.PLUGIN.activate(
+                SimpleNamespace(identity="identity", host="host")
+            )
+            first = activation.create_implementation("cobra-solve")
+            second = activation.create_implementation("cobra-solve")
+
+        class CoordinatedRules(list):
+            def __init__(self, values):
+                super().__init__(values)
+                self.first_iteration = threading.Event()
+                self.second_iteration = threading.Event()
+                self.allow_first = threading.Event()
+                self.allow_second = threading.Event()
+                self._iteration_count = 0
+                self._iteration_lock = threading.Lock()
+
+            def __iter__(self):
+                with self._iteration_lock:
+                    self._iteration_count += 1
+                    iteration = self._iteration_count
+                if iteration == 1:
+                    self.first_iteration.set()
+                    self.allow_first.wait(2)
+                elif iteration == 2:
+                    self.second_iteration.set()
+                    self.allow_second.wait(2)
+                return super().__iter__()
+
+        rules = CoordinatedRules([first, second])
+        activation._rules = rules
+        errors = []
+
+        def release_second():
+            try:
+                activation.release_implementation(second)
+            except BaseException as error:
+                errors.append(error)
+
+        def release_first():
+            try:
+                activation.release_implementation(first)
+            except BaseException as error:
+                errors.append(error)
+
+        second_thread = threading.Thread(target=release_second)
+        first_thread = threading.Thread(target=release_first)
+        second_thread.start()
+        self.assertTrue(rules.first_iteration.wait(2))
+        first_thread.start()
+        second_iteration_started = rules.second_iteration.wait(2)
+        if second_iteration_started:
+            rules.allow_second.set()
+        rules.allow_first.set()
+        rules.allow_second.set()
+        second_thread.join(2)
+        first_thread.join(2)
+
+        self.assertFalse(second_thread.is_alive())
+        self.assertFalse(first_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertCountEqual(cleaned, [first, second])
+        self.assertEqual(rules, [])
+
+    def test_concurrent_create_and_close_drains_new_rule_once(self):
+        plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
+        construction_started = threading.Event()
+        allow_construction = threading.Event()
+        close_reached_rules = threading.Event()
+        cleaned = []
+
+        class FakeRule:
+            def close_store(self):
+                cleaned.append(self)
+
+        class Rules(list):
+            def clear(self):
+                close_reached_rules.set()
+                super().clear()
+
+        def load_rule_class():
+            construction_started.set()
+            self.assertTrue(allow_construction.wait(2))
+            return FakeRule
+
+        with mock.patch.object(
+            plugin, "_load_rule_class", side_effect=load_rule_class
+        ), mock.patch.object(plugin, "_native_host_services", return_value=object()):
+            activation = plugin.PLUGIN.activate(
+                SimpleNamespace(identity="identity", host="host")
+            )
+            activation._rules = Rules()
+            errors = []
+            created = []
+
+            def create():
+                try:
+                    created.append(activation.create_implementation("cobra-solve"))
+                except BaseException as error:
+                    errors.append(error)
+
+            def close():
+                try:
+                    activation.close()
+                except BaseException as error:
+                    errors.append(error)
+
+            create_thread = threading.Thread(target=create)
+            close_thread = threading.Thread(target=close)
+            create_thread.start()
+            self.assertTrue(construction_started.wait(2))
+            close_thread.start()
+            close_reached_rules.wait(0.2)
+            allow_construction.set()
+            create_thread.join(2)
+            close_thread.join(2)
+
+            self.assertFalse(create_thread.is_alive())
+            self.assertFalse(close_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(created), 1)
+            self.assertEqual(cleaned, created)
+            self.assertEqual(activation._rules, [])
+
     def test_plugin_probe_preserves_binding_availability(self):
         plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
         with mock.patch("d810_cobra.solve.d810_backend_probe", return_value="missing binding"):
