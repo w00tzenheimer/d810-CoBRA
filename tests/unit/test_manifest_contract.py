@@ -75,6 +75,112 @@ class TestPluginActivation(unittest.TestCase):
         with self.assertRaises(ValueError):
             activation.create_implementation("other")
 
+    def test_release_implementation_uses_exact_identity_not_equality(self):
+        plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
+        cleaned = []
+
+        class EqualRule:
+            def __init__(self):
+                self.name = str(len(cleaned))
+
+            def __eq__(self, _other):
+                return True
+
+            def close_store(self):
+                cleaned.append(self)
+
+        context = SimpleNamespace(identity="identity", host="host")
+        with mock.patch.object(plugin, "_load_rule_class", return_value=EqualRule), \
+             mock.patch.object(plugin, "_native_host_services", return_value=object()):
+            activation = plugin.PLUGIN.activate(context)
+            first = activation.create_implementation("cobra-solve")
+            second = activation.create_implementation("cobra-solve")
+
+        activation.release_implementation(second)
+
+        self.assertEqual(len(cleaned), 1)
+        self.assertIs(cleaned[0], second)
+        self.assertEqual(len(activation._rules), 1)
+        self.assertIs(activation._rules[0], first)
+
+    def test_binding_failure_cleans_unpublished_rule(self):
+        plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
+        calls = []
+
+        class FailingRule:
+            def bind_mba_host(self, _host):
+                raise RuntimeError("bind failed")
+
+            def stop_escalator(self):
+                calls.append("stop")
+
+            def flush_store(self):
+                calls.append("flush")
+
+            def close_store(self):
+                calls.append("close")
+
+        with mock.patch.object(plugin, "_load_rule_class", return_value=FailingRule), \
+             mock.patch.object(plugin, "_native_host_services", return_value=object()):
+            activation = plugin.PLUGIN.activate(
+                SimpleNamespace(identity="identity", host="host")
+            )
+            with self.assertRaisesRegex(RuntimeError, "bind failed"):
+                activation.create_implementation("cobra-solve")
+
+        self.assertEqual(calls, ["stop", "flush", "close"])
+        self.assertEqual(activation._rules, [])
+
+    def test_binding_and_cleanup_failures_are_aggregated(self):
+        plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
+
+        class FailingRule:
+            def bind_mba_host(self, _host):
+                raise KeyboardInterrupt("bind failed")
+
+            def close_store(self):
+                raise SystemExit("cleanup failed")
+
+        with mock.patch.object(plugin, "_load_rule_class", return_value=FailingRule), \
+             mock.patch.object(plugin, "_native_host_services", return_value=object()):
+            activation = plugin.PLUGIN.activate(
+                SimpleNamespace(identity="identity", host="host")
+            )
+            with self.assertRaises(BaseException) as raised:
+                activation.create_implementation("cobra-solve")
+
+        self.assertIsInstance(raised.exception.exceptions[0], KeyboardInterrupt)
+        self.assertIsInstance(raised.exception.exceptions[1], SystemExit)
+        self.assertEqual(activation._rules, [])
+
+    def test_cleanup_lookup_failure_is_aggregated_and_remaining_steps_run(self):
+        plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
+        calls = []
+
+        class FailingRule:
+            def __getattribute__(self, name):
+                if name == "stop_escalator":
+                    raise RuntimeError("cleanup lookup failed")
+                return super().__getattribute__(name)
+
+            def bind_mba_host(self, _host):
+                raise KeyboardInterrupt("bind failed")
+
+            def flush_store(self):
+                calls.append("flush")
+
+        with mock.patch.object(plugin, "_load_rule_class", return_value=FailingRule), \
+             mock.patch.object(plugin, "_native_host_services", return_value=object()):
+            activation = plugin.PLUGIN.activate(
+                SimpleNamespace(identity="identity", host="host")
+            )
+            with self.assertRaises(BaseException) as raised:
+                activation.create_implementation("cobra-solve")
+
+        self.assertIsInstance(raised.exception.exceptions[0], KeyboardInterrupt)
+        self.assertIn("cleanup lookup failed", str(raised.exception.exceptions[1]))
+        self.assertEqual(calls, ["flush"])
+
     def test_activation_close_is_idempotent_and_continues_after_failures(self):
         plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
         calls = []
@@ -106,10 +212,45 @@ class TestPluginActivation(unittest.TestCase):
             activation = plugin.PLUGIN.activate(context)
             activation.create_implementation("cobra-solve")
             activation.create_implementation("cobra-solve")
-            activation.close()
+            with self.assertRaises(BaseException):
+                activation.close()
             activation.close()
 
         self.assertEqual(calls, ["stop", "flush", "close", "stop", "flush", "close"])
+
+    def test_activation_close_aggregates_base_exceptions_and_clears_ownership(self):
+        plugin = __import__("d810_cobra.plugin", fromlist=["PLUGIN"])
+        calls = []
+
+        class FatalStop(BaseException):
+            pass
+
+        class FailingRule:
+            def stop_escalator(self):
+                calls.append("stop")
+                raise FatalStop("stop failed")
+
+            def flush_store(self):
+                calls.append("flush")
+                raise SystemExit("flush failed")
+
+            def close_store(self):
+                calls.append("close")
+                raise RuntimeError("close failed")
+
+        context = SimpleNamespace(identity="identity", host="host")
+        with mock.patch.object(plugin, "_load_rule_class", return_value=FailingRule), \
+             mock.patch.object(plugin, "_native_host_services", return_value=object()):
+            activation = plugin.PLUGIN.activate(context)
+            rule = activation.create_implementation("cobra-solve")
+            with self.assertRaises(BaseException) as raised:
+                activation.close()
+            self.assertIsInstance(raised.exception.exceptions[0], FatalStop)
+            self.assertIsInstance(raised.exception.exceptions[1], SystemExit)
+
+            activation.release_implementation(rule)
+
+        self.assertEqual(calls, ["stop", "flush", "close"])
 
 
 if __name__ == "__main__":

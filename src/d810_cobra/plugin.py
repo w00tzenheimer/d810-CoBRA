@@ -7,7 +7,22 @@ by one activation.
 
 from __future__ import annotations
 
+import builtins
+
 from d810.core.plugins import BackendPlugin, PluginActivationContext
+
+
+class _FallbackBaseExceptionGroup(BaseException):
+    """Minimal BaseException-group compatibility for Python 3.10."""
+
+    def __init__(self, message: str, exceptions: list[BaseException]) -> None:
+        super().__init__(message)
+        self.exceptions = tuple(exceptions)
+
+
+_BASE_EXCEPTION_GROUP = getattr(
+    builtins, "BaseExceptionGroup", _FallbackBaseExceptionGroup
+)
 
 
 def _native_host_services():
@@ -39,29 +54,68 @@ class _CobraActivation:
         if self._closed:
             raise RuntimeError("CoBRA activation is closed")
         rule = _load_rule_class()()
-        bind_host = getattr(rule, "bind_mba_host", None)
-        if callable(bind_host):
-            bind_host(self._native_host)
+        try:
+            bind_host = getattr(rule, "bind_mba_host", None)
+            if callable(bind_host):
+                bind_host(self._native_host)
+        except BaseException as error:
+            cleanup_errors = self._cleanup_rule(rule)
+            if cleanup_errors:
+                raise _BASE_EXCEPTION_GROUP(
+                    "CoBRA implementation construction and cleanup failed",
+                    [error, *cleanup_errors],
+                )
+            raise
         self._rules.append(rule)
         return rule
 
     def capability_offers(self) -> tuple[object, ...]:
         return ()
 
+    @staticmethod
+    def _cleanup_rule(rule: object) -> list[BaseException]:
+        errors: list[BaseException] = []
+        for method_name in ("stop_escalator", "flush_store", "close_store"):
+            try:
+                method = getattr(rule, method_name, None)
+            except BaseException as exc:
+                errors.append(exc)
+                continue
+            if not callable(method):
+                continue
+            try:
+                method()
+            except BaseException as exc:
+                errors.append(exc)
+        return errors
+
+    def release_implementation(self, implementation: object) -> None:
+        """Release one rule without closing its shared activation."""
+        if self._closed:
+            return
+        for index, rule in enumerate(self._rules):
+            if rule is implementation:
+                del self._rules[index]
+                break
+        else:
+            return
+        errors = self._cleanup_rule(implementation)
+        if errors:
+            raise _BASE_EXCEPTION_GROUP("CoBRA implementation release failed", errors)
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        for rule in tuple(self._rules):
-            for method_name in ("stop_escalator", "flush_store", "close_store"):
-                method = getattr(rule, method_name, None)
-                if callable(method):
-                    try:
-                        method()
-                    except Exception:
-                        # One malformed cache or worker must not leak the rest
-                        # of the activation's instances.
-                        continue
+        rules = tuple(self._rules)
+        self._rules.clear()
+        errors: list[BaseException] = []
+        for rule in rules:
+            errors.extend(self._cleanup_rule(rule))
+        self._context = None
+        self._native_host = None
+        if errors:
+            raise _BASE_EXCEPTION_GROUP("CoBRA plugin close failed", errors)
 
 
 class _CobraPlugin:
