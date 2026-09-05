@@ -104,7 +104,7 @@ backends — so this package supplies the `mba-solve` implementation rather than
 overriding one:
 
 ```
-cobra   available   d810-cobra 0.1.4
+cobra   available   d810-cobra 0.1.5
 ```
 
 Check it with `d810cli backends`. Without this package installed, d810's
