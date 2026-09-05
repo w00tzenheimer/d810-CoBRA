@@ -5,7 +5,14 @@ Two CPython 3.13 manylinux wheels, built with the repository's own
 once again after installing the finished artifact in a container that has none
 of the build toolchain present.
 
-## Artifacts
+This file records two rounds. **[Published artifacts](#published-artifacts)** are
+what PyPI serves and what anyone installing `d810-cobra==0.1.5` receives — those
+are the hashes to check against. The local preflight round below came first, on
+the same source, to establish that the release was worth cutting at all. The two
+rounds have different hashes because the build is not reproducible; that is
+expected and is explained at the end.
+
+## Preflight artifacts (local, superseded by the published set)
 
 | | aarch64 | x86-64 |
 |---|---|---|
@@ -18,27 +25,72 @@ of the build toolchain present.
 | **Extension** | `d810_cobra/_cobra.cpython-313-aarch64-linux-gnu.so` | `d810_cobra/_cobra.cpython-313-x86_64-linux-gnu.so` |
 | **Build time** | 3m06s (native) | 6m26s (Rosetta) |
 
-Both wheels are in `dist/`.
+These were built on an Apple Silicon workstation, the x86-64 one under Rosetta.
+They were never uploaded anywhere; the published wheels were rebuilt from
+source by CI on native runners.
 
 Each SHA-256 was computed three times independently and agrees each time:
 cibuildwheel's own report, a `hashlib` pass over the finished file, and
 `shasum -a 256` on macOS.
+
+## Published artifacts
+
+Built by `deploy.yml` run
+[33983949988](https://github.com/w00tzenheimer/d810-CoBRA/actions/runs/33983949988)
+on the `v0.1.5` release, uploaded to PyPI by Trusted Publishing at
+2026-09-05T18:33Z. All five platform legs plus the sdist went green, which is
+what the `publish` job's `needs:` gate requires.
+
+| | aarch64 | x86-64 |
+|---|---|---|
+| **Wheel** | `d810_cobra-0.1.5-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl` | `d810_cobra-0.1.5-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` |
+| **SHA-256** | `2c85ffe14a1f3c1d2b750790332a7c0a5e911b35f7fc041ebedcd6532382c63c` | `352133fd4f91227518714735b463b978760650b5f30c71f5276c0bccb90cb72c` |
+| **Size** | 2 093 472 bytes | 2 215 083 bytes |
+| **Python / ABI** | `cp313` / `cp313` | `cp313` / `cp313` |
+| **Platform tag** | `manylinux_2_26_aarch64.manylinux_2_28_aarch64` | `manylinux_2_27_x86_64.manylinux_2_28_x86_64` |
+| **Built on** | `ubuntu-24.04-arm` (native) | `ubuntu-latest` (native) |
+| **Requires-Python** | `>=3.10` | `>=3.10` |
+
+Each hash was computed locally over the downloaded file and compared against the
+`sha256` PyPI recorded at upload; both agree. Those are two independent records
+of the same artifact, so a match means the bytes checked here are the bytes PyPI
+is serving.
+
+Both were downloaded, installed with `--no-deps` in a stock `python:3.13-slim`
+container of their own architecture, and re-run through
+`tools/verify_binding.py`. Both solved `(x|y) - (x&y) -> x ^ y`, with the
+manifest reading back as `api_version` 1 and
+`implements = {"mba-solve": "cobra-solve"}`.
+
+The published wheels are byte-for-byte the same *size* as the preflight ones but
+have different hashes — the difference is timestamps, not content. See the note
+on reproducibility at the end.
+
+`0.1.5` ships 20 wheels (cp310–cp313 across manylinux aarch64/x86-64, Windows
+amd64, and macOS arm64/x86-64) plus an sdist. Only the two cp313 Linux wheels
+were verified here.
 
 ## Provenance
 
 | | |
 |---|---|
 | **Parent commit** | `3b3c406270f1efd8e222f0b05040ae4e074b27d5` (`build: publish corrected CoBRA dependency pin`) |
-| **Release commit** | `55540ab84d95bde080a5c1223f034b61fb483492` (`build: release 0.1.5`) |
-| **Tree built** | `db5cac138c825e308dd5b275cb43561c6dbab9d9` |
+| **Version bump** | `55540ab84d95bde080a5c1223f034b61fb483492` (`build: release 0.1.5`) |
+| **Tag `v0.1.5`** | `73b405c106d78e1fdc7576b217de39b7dcd0ddb3` — the commit CI built the published wheels from |
+| **Tree built (preflight)** | `db5cac138c825e308dd5b275cb43561c6dbab9d9` (the tree of `55540ab`) |
 | **`third_party/cobra`** | `72f616f822f538a0cfbea3c880f9d1e68bb9a8f1` (`v1.3.0-13-g72f616f`) |
-| **Worktree** | `.claude/worktrees/cobra-wheels-0.1.5`, branch `worktree-cobra-wheels-0.1.5` |
+| **Preflight worktree** | `.claude/worktrees/cobra-wheels-0.1.5`, branch `worktree-cobra-wheels-0.1.5` |
 
-The release commit changes two lines — `version` in `pyproject.toml` and the
+`73b405c` adds only this file on top of `55540ab`, so the published wheels and
+the preflight wheels were built from identical package sources — the difference
+between the two trees is documentation, which `setup.py` does not read.
+
+The version bump changes two lines — `version` in `pyproject.toml` and the
 matching sample output in `README.md`. Nothing under `src/` differs from the
 parent commit, and `d810` was not touched.
 
-The working tree was clean at `55540ab` when the wheels were produced, so the
+The working tree was clean at `55540ab` when the preflight wheels were produced,
+so the
 tree above is the exact input to both builds. cibuildwheel copies the project
 into its container rather than bind-mounting it, so neither build wrote into the
 checkout: `third_party/cobra` still has no `build/` or `build-deps/` afterwards
@@ -129,7 +181,7 @@ unrelated to whatever a PR changes.
 ## Reproducing
 
 ```console
-git checkout 55540ab84d95bde080a5c1223f034b61fb483492
+git checkout v0.1.5                            # 73b405c
 git submodule update --init --recursive        # -> 72f616f
 
 export CIBW_PLATFORM=linux
@@ -154,8 +206,20 @@ docker run --rm --platform linux/arm64 -v "$PWD/wheelhouse":/wheels:ro \
 ```
 
 The build is not bit-for-bit reproducible: `SOURCE_DATE_EPOCH` is unset, and
-every zip entry in both wheels carries the build wall-clock time
+every zip entry in both preflight wheels carries the build wall-clock time
 (`2026-09-05 17:38:18` and `17:41:58` UTC respectively — one distinct timestamp
-per wheel). A rebuild from the same source will therefore produce a different
-SHA-256. The hashes above identify these artifacts; they are not a
-reproducibility claim.
+per wheel). A rebuild from the same source therefore produces a different
+SHA-256.
+
+This is exactly what the two rounds in this file demonstrate, and why the
+preflight hashes are kept rather than overwritten:
+
+| | preflight | published |
+|---|---|---|
+| aarch64 | `b71d40e4…ddf3ab25` | `2c85ffe1…2382c63c` |
+| x86-64 | `c642e6a6…3beaa762` | `352133fd…b90cb72c` |
+
+Same source, same sizes to the byte, different hashes. Neither pair of hashes
+is evidence about the other; each identifies the artifact it names. Verify a
+download against the **published** hashes, or against PyPI's own recorded
+digests, never against the preflight set.
