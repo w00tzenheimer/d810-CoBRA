@@ -68,6 +68,12 @@ def tree_to_ast(
             raise ReconstructionError(f"no snapshot recorded for leaf {name!r}")
         leaf = AstLeaf(name)
         leaf.mop = snapshot.to_mop()
+        if snapshot.size != dest_size:
+            if snapshot.size not in (1, 2, 4, 8) or snapshot.size > dest_size:
+                raise ReconstructionError("cannot widen this scalar binding")
+            extended = AstNode(ida_hexrays.m_xdu, leaf)
+            extended.dest_size = dest_size
+            return extended
         return leaf
 
     if kind == "un":

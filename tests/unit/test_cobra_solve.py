@@ -208,6 +208,7 @@ class TestProviderOutcomePublication:
 
         class Builder:
             snapshots = {"a": Snapshot(), "b": Snapshot()}
+            source_widths = {4}
 
             def instruction(self, _ins):
                 if unsupported:

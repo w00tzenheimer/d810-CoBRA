@@ -33,7 +33,9 @@ from d810_cobra.detect import (
     DEFAULT_MAX_LEAVES,
     MbaCandidate,
     UnsupportedMicrocode,
+    WidthLiftBudgetExceeded,
     _TreeBuilder,
+    _WidthTreeBuilder,
     _walk,
 )
 from d810_cobra.escalate import EscalationProver
@@ -45,13 +47,15 @@ from d810_cobra.prove import (
     prove_equivalent,
 )
 from d810_cobra.store import ProofCacheStore, proof_cache_db_path
-from d810_cobra.table import Outcome, RewriteTable
+from d810_cobra.table import Outcome, RewriteTable, canonical_key, DEFAULT_MAX_ENTRIES
+from d810_cobra.width_prove import prove_width_equivalent
 from d810_cobra.solve import (
     SolveStatus,
     binding_available,
     solve_signature,
 )
 from d810.core import getLogger
+from d810.core.cache import CacheImpl
 from d810.mba.extension_api import (
     NativeMbaCandidate,
     NativeMbaHostServices,
@@ -123,6 +127,10 @@ class CobraSolveRule(PeepholeSimplificationRule):
         # or not a project activates them -- starting in __init__ would spawn a
         # worker thread per dead copy.
         self.table = RewriteTable()
+        # width-lift-v1 is process-local and proof-required. In particular it
+        # must never load legacy PROVED entries written with proof disabled.
+        self._width_lift_table = RewriteTable()
+        self._width_lift_abstentions = CacheImpl(max_size=DEFAULT_MAX_ENTRIES)
         self.escalator = EscalationProver(self.table)
         # The durable cache is loaded lazily, not here: the manager assigns
         # ``log_dir`` *after* construction, so resolving the path now would
@@ -424,11 +432,19 @@ class CobraSolveRule(PeepholeSimplificationRule):
                 ProviderOutcomeStatus.INELIGIBLE, "unsupported_width"
             )
             return None
-        # Uniform widths only: a leaf narrower than the destination produces
-        # mixed operand sizes that IDA's verifier rejects.
-        if any(builder.snapshots[n].size != dest_size for n in names):
-            self._finish_attempt(ProviderOutcomeStatus.INELIGIBLE, "mixed_widths")
-            return None
+        width_lift = any(size != dest_size for size in builder.source_widths)
+        if width_lift:
+            try:
+                builder = _WidthTreeBuilder(dest_size)
+                tree = builder.instruction(ins)
+            except WidthLiftBudgetExceeded as exc:
+                self._finish_attempt(ProviderOutcomeStatus.OVER_BUDGET, str(exc))
+                return None
+            except UnsupportedMicrocode:
+                self._finish_attempt(ProviderOutcomeStatus.INELIGIBLE, "width_lift_unsupported")
+                return None
+            names, ops = [], []
+            _walk(tree, names, ops)
 
         candidate = MbaCandidate(
             ea=ins.ea,
@@ -444,6 +460,9 @@ class CobraSolveRule(PeepholeSimplificationRule):
                 ProviderOutcomeStatus.UNAVAILABLE, "solver_unavailable"
             )
             return None
+
+        if width_lift:
+            return self._solve_width_lift(candidate, ins)
 
         # --- tier 1: the table. A hit skips BOTH solving and proving. -------
         self._ensure_store()
@@ -536,7 +555,52 @@ class CobraSolveRule(PeepholeSimplificationRule):
         self._record_and_maybe_flush()
         return self._install(candidate, result.tree, ins)
 
-    def _install(self, candidate, rewrite, ins):
+    def _solve_width_lift(self, candidate, ins):
+        """The new domain never inherits proof-disabled or durable authority."""
+        table = self._width_lift_table
+        key = canonical_key(candidate.tree, candidate.bitwidth)
+        abstention = self._width_lift_abstentions.get(key)
+        if abstention is not None:
+            status, reason = abstention
+            self._finish_attempt(status, reason)
+            return None
+        entry = table.lookup(candidate.tree, candidate.bitwidth)
+        if entry is not None:
+            if getattr(entry.outcome, 'value', None) == Outcome.PROVED.value:
+                return self._install(candidate, entry.rewrite, ins, proof_verified=True)
+            self._finish_attempt(ProviderOutcomeStatus.UNCHANGED, 'width_cached_no_rewrite')
+            return None
+        result = solve_signature(candidate.tree, candidate.leaf_names, candidate.bitwidth)
+        if (getattr(result.status, 'value', None) == SolveStatus.FAILED.value
+                or (getattr(result.status, 'value', None) == SolveStatus.SOLVED.value
+                    and result.tree is None)):
+            self._width_lift_abstentions[key] = (
+                ProviderOutcomeStatus.ERROR, 'solver_failed')
+            self._finish_attempt(ProviderOutcomeStatus.ERROR, 'solver_failed')
+            return None
+        if (getattr(result.status, 'value', None) != SolveStatus.SOLVED.value
+                or result.tree is None or not accept_rewrite(candidate.tree, result.tree)):
+            table.record_no_rewrite(candidate.tree, candidate.bitwidth)
+            self._finish_attempt(ProviderOutcomeStatus.UNCHANGED, 'width_no_rewrite')
+            return None
+        verdict = prove_width_equivalent(candidate.tree, result.tree, candidate.leaf_names,
+                                         candidate.bitwidth, timeout_ms=INLINE_TIMEOUT_MS)
+        if getattr(verdict, 'value', None) != ProofResult.PROVED.value:
+            # A bounded abstention, never a proof. Do not publish through the
+            # legacy escalator/store (whose policy may have proof disabled).
+            value = getattr(verdict, 'value', 'unknown')
+            status = {
+                ProofResult.REFUTED.value: ProviderOutcomeStatus.PROOF_FAILED,
+                ProofResult.UNAVAILABLE.value: ProviderOutcomeStatus.UNAVAILABLE,
+            }.get(value, ProviderOutcomeStatus.OVER_BUDGET)
+            reason = 'width_proof_' + value
+            self._width_lift_abstentions[key] = (status, reason)
+            self._finish_attempt(status, reason)
+            return None
+        table.record_proved(candidate.tree, candidate.bitwidth, result.tree)
+        return self._install(candidate, result.tree, ins, proof_verified=True)
+
+    def _install(self, candidate, rewrite, ins, *, proof_verified=False):
         if rewrite is None:
             return None
         try:
@@ -547,7 +611,7 @@ class CobraSolveRule(PeepholeSimplificationRule):
             )
             self._finish_attempt(
                 ProviderOutcomeStatus.IMPROVED,
-                proof_verdict=True if self.require_proof else None,
+                proof_verdict=True if self.require_proof or proof_verified else None,
             )
             return out
         except ReconstructionError as exc:

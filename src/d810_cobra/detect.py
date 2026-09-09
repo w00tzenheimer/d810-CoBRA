@@ -68,6 +68,10 @@ class UnsupportedMicrocode(Exception):
     """This instruction cannot be modelled exactly, so it is not a candidate."""
 
 
+class WidthLiftBudgetExceeded(UnsupportedMicrocode):
+    """An exact lift exceeded its callback-local resource allowance."""
+
+
 @dataclasses.dataclass(frozen=True)
 class MbaCandidate:
     """One MBA expression, reassembled across instructions."""
@@ -108,6 +112,113 @@ def _render(tree: dict, varmap: dict[str, str]) -> str:
     return f"({_render(tree['a'], varmap)}{tree['op']}{_render(tree['b'], varmap)})"
 
 
+class _WidthTreeBuilder:
+    """Callback-local fixed-W lift with owned, exact scalar bindings.
+
+    Each source operation truncates before widening. Register aliases share a
+    binding only for a known value number and identical native byte location;
+    the widest view must already occur in this expression. No wider read is
+    invented. This representation belongs to a separate proof/cache domain.
+    """
+
+    def __init__(self, dest_size: int) -> None:
+        if dest_size not in (1, 2, 4, 8):
+            raise UnsupportedMicrocode("unsupported root width")
+        self.dest_size = dest_size
+        self.snapshots: dict[str, MopSnapshot] = {}
+        self._depth = 0
+        self._used = False
+        self._nodes = 0
+
+    def _node(self, **fields) -> dict:
+        if self._nodes >= _MAX_INLINE_NODES:
+            raise WidthLiftBudgetExceeded('width_lift_node_budget')
+        self._nodes += 1
+        return fields
+
+    def _mask(self, tree: dict, size: int) -> dict:
+        if size not in (1, 2, 4, 8) or size > self.dest_size:
+            raise UnsupportedMicrocode("unsupported source width")
+        if size == self.dest_size:
+            return tree
+        mask = self._node(kind="const", value=(1 << (8 * size)) - 1)
+        return self._node(kind="bin", op="&", a=tree, b=mask)
+
+    def operand(self, op) -> dict:
+        if op is None:
+            raise UnsupportedMicrocode("missing operand")
+        if op.t == ida_hexrays.mop_d:
+            if op.size != op.d.d.size:
+                raise UnsupportedMicrocode("nested operand/result width mismatch")
+            return self.instruction(op.d)
+        if op.t == ida_hexrays.mop_n:
+            return self._mask(self._node(kind="const", value=int(op.nnn.value)), op.size)
+        if op.t not in _LEAF_TYPES:
+            raise UnsupportedMicrocode(f"operand type {op.t}")
+        snapshot = MopSnapshot.from_mop(op)
+        # Snapshot equality includes storage, source size and value number.
+        name = next((key for key, value in self.snapshots.items()
+                     if value == snapshot), None)
+        if name is None:
+            name = f"leaf{len(self.snapshots)}"
+            self.snapshots[name] = snapshot
+        return self._mask(self._node(kind="var", name=name), snapshot.size)
+
+    def instruction(self, ins) -> dict:
+        if ins is None:
+            raise UnsupportedMicrocode("missing instruction")
+        if self._depth >= _MAX_INLINE_DEPTH:
+            raise WidthLiftBudgetExceeded('width_lift_depth_budget')
+        outermost = self._depth == 0
+        if outermost:
+            if self._used:
+                raise UnsupportedMicrocode("width builder is single-callback only")
+            self._used = True
+        self._depth += 1
+        try:
+            opcode = ins.opcode
+            if opcode == M_XDU:
+                if ins.l.size > ins.d.size:
+                    raise UnsupportedMicrocode("invalid zero extension")
+                tree = self.operand(ins.l)
+            elif opcode == M_MOV:
+                tree = self.operand(ins.l)
+            elif opcode in _UNOP:
+                tree = self._node(kind="un", op=_UNOP[opcode], a=self.operand(ins.l))
+            elif opcode in _BINOP:
+                tree = self._node(kind="bin", op=_BINOP[opcode],
+                                  a=self.operand(ins.l), b=self.operand(ins.r))
+            else:
+                raise UnsupportedMicrocode(f"width lift opcode {opcode}")
+            tree = self._mask(tree, ins.d.size)
+        finally:
+            self._depth -= 1
+        if outermost:
+            aliases = {}
+            for name, snap in self.snapshots.items():
+                if snap.t != ida_hexrays.mop_r or snap.valnum <= 0:
+                    continue
+                options = [(other.size, key) for key, other in self.snapshots.items()
+                           if other.t == snap.t and other.reg == snap.reg
+                           and other.valnum == snap.valnum]
+                aliases[name] = max(options)[1]
+
+            def substitute(node):
+                if node['kind'] == 'var':
+                    return {'kind': 'var', 'name': aliases.get(node['name'], node['name'])}
+                result = dict(node)
+                for slot in ('a', 'b'):
+                    if slot in node:
+                        result[slot] = substitute(node[slot])
+                return result
+
+            tree = substitute(tree)
+            retained = {aliases.get(name, name) for name in self.snapshots}
+            self.snapshots = {name: snap for name, snap in self.snapshots.items()
+                              if name in retained}
+        return tree
+
+
 class _TreeBuilder:
     """Builds trees for one block, snapshotting the operand behind each leaf.
 
@@ -119,10 +230,12 @@ class _TreeBuilder:
 
     def __init__(self) -> None:
         self.snapshots: dict[str, MopSnapshot] = {}
+        self.source_widths: set[int] = set()
 
     def operand(self, op) -> dict:
         if op is None:
             raise UnsupportedMicrocode("missing operand")
+        self.source_widths.add(op.size)
         if op.t == ida_hexrays.mop_n:
             return {"kind": "const", "value": int(op.nnn.value)}
         if op.t == ida_hexrays.mop_d:
@@ -137,6 +250,7 @@ class _TreeBuilder:
     def instruction(self, ins) -> dict:
         if ins is None:
             raise UnsupportedMicrocode("missing instruction")
+        self.source_widths.add(ins.d.size)
         opcode = ins.opcode
 
         # shl by a constant is exact multiplication by 2**k.
