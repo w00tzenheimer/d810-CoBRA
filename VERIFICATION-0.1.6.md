@@ -60,25 +60,25 @@ Docker runner's default `D810_NO_CYTHON=0` requires.
 | d810 acceptance: live CoBRA outcome persisted by ordinary decompilation | passed when run alone; fails when run with the whole file (see below) |
 | CoBRA `test_cobra_detect_convert.py` | 13 passed |
 | CoBRA `test_cobra_width_lift.py` (at `bc803e9`) | 35 passed, 3 skipped |
-| CoBRA `test_cobra_provider_publication.py` (at `f202d61`) | **8 failed** |
+| CoBRA `test_cobra_provider_publication.py` (at `dc6762b`, rewritten onto d810's real registry) | 8 passed |
 
 The same run with the published **0.1.5** aarch64 wheel gave the same d810
-results. It also segfaulted in `test_cobra_provider_publication.py`, so none of
-the in-IDA problems are 0.1.6 regressions.
+results. It also segfaulted in `test_cobra_provider_publication.py` before the
+test fixes, so none of the in-IDA problems were 0.1.6 regressions.
 
 ### Open items
 
-- **`test_cobra_provider_publication.py` fails against d810 1.0.0b2.** The
-  segfault and the stale `source_widths` double are fixed. What remains comes
-  from the test's hand-built imitation of d810's optimizer and mutation
-  lifecycle:
-  - d810's instruction commit now verifies and quarantines the synthetic
-    replacement (`NativeMutationQuarantined: verification-failed`);
-  - the manager calls `hash_minsn` more often than the mocked iterator supplies;
-  - no provider-attempt rows reach the store.
-
-  The rule itself behaves correctly in these cases: the log shows it applying,
-  refusing and refuting as each case intends.
+- **`test_cobra_provider_publication.py` was rewritten (`dc6762b`).** The old
+  version imitated d810's optimizer and mutation lifecycle by hand, and failed
+  against 1.0.0b2 in a different d810 internal after each fix. It now activates
+  cobra-solve through d810's real registry, host capability registry and
+  pipeline-v2 schedule, with a real native instruction and the real mutation
+  commit. Only CoBRA's own seams are patched.
+  - The accepted case runs a real solve, proof and commit:
+    `add (zf.4+sf.4), (#0xFFFFFFFE.4*(zf.4 & sf.4)), cc^2.4` becomes
+    `xor zf.4, sf.4, cc^2.4`.
+  - Two deliberately broken copies (a wrong expected status, and a forced
+    unavailable binding) were both reported as failures.
 - **Three width-lift cases skip.** They need a `native_mba` fixture, meaning an
   `mba_t` for the binary whose EAs `0x18F557265BF`, `0x18F55734E71` and
   `0x18F5575CD50` they hardcode. No conftest in d810 or here defines it.
