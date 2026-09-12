@@ -149,6 +149,9 @@ class _Snapshot:
 
 class _Builder:
     snapshots = {"a": _Snapshot(), "b": _Snapshot()}
+    # Mirrors detect._TreeBuilder: every operand and the destination are 4
+    # bytes, so the rule stays on its same-width path and never width-lifts.
+    source_widths = {4}
 
     def instruction(self, _instruction):
         return {
