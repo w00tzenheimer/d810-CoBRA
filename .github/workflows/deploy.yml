@@ -75,7 +75,7 @@ jobs:
               env:
                   # cibuildwheel tests a wheel by `pip install`ing it, which
                   # resolves runtime dependencies. This package requires
-                  # d810-ng>=0.7.0, which is not released, so that install
+                  # d810-ng>=1.0.0b0, which is not on PyPI, so that install
                   # fails on the dependency and never reaches the binding --
                   # reporting a packaging fact as a build failure. The binding
                   # needs no d810 to be exercised, so the TEST install skips
@@ -160,3 +160,34 @@ jobs:
                   path: dist
                   merge-multiple: true
             - uses: pypa/gh-action-pypi-publish@release/v1
+
+    # Attach the same artifacts to the GitHub release. Without this the release
+    # page lists no files at all and the wheels are findable only on PyPI, which
+    # read as "no Windows wheel" to someone looking at the release.
+    #
+    # A separate job, not a step in `publish`, for two reasons. `publish` must
+    # keep exactly `id-token: write` -- widening its permissions is not needed
+    # for the upload -- and a failure here must not block the PyPI upload,
+    # which is the release of record.
+    release_assets:
+        needs: [build_wheels, build_sdist]
+        runs-on: ubuntu-latest
+        if: github.event_name == 'release'
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  path: dist
+                  merge-multiple: true
+            # SHA256SUMS lets a downloader check a file against this run's
+            # output without trusting the release page's own display.
+            - name: Checksum
+              working-directory: dist
+              run: sha256sum -- * | tee SHA256SUMS
+            - name: Upload to release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: >-
+                  gh release upload "${{ github.event.release.tag_name }}"
+                  dist/* --clobber --repo "${{ github.repository }}"
