@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import platform
 from collections import defaultdict
 from types import SimpleNamespace
 from unittest import mock
@@ -44,6 +46,15 @@ from d810.hexrays.hooks.optinsn_adapter import InstructionOptimizerManager
 
 from d810_cobra.plugin import PLUGIN
 from d810_cobra.rules import cobra_solve
+
+
+def _get_default_binary() -> str:
+    override = os.environ.get("D810_TEST_BINARY")
+    if override:
+        return override
+    return (
+        "libobfuscated.dylib" if platform.system() == "Darwin" else "libobfuscated.dll"
+    )
 
 
 class _Optimizer(InstructionOptimizer):
@@ -195,96 +206,102 @@ def _runtime_rule():
     return store, activation, rule, optimizer, block, instruction, identity, candidate, replacement
 
 
-@pytest.mark.parametrize(
-    ("case", "expected_status", "expected_rows"),
-    [
-        ("unavailable", "unavailable", 1),
-        ("unchanged", "unchanged", 1),
-        ("accept_refusal", "unchanged", 1),
-        ("refuted", "proof_failed", 1),
-        ("timeout", "over_budget", 1),
-        ("reconstruction", "reconstruction_failed", 1),
-        ("rejected", "improved", 1),
-        ("accepted", None, 0),
-    ],
-)
-def test_cobra_gates_publish_through_real_outer_lifecycle(
-    case, expected_status, expected_rows
-):
-    (
-        store,
-        activation,
-        rule,
-        optimizer,
-        block,
-        instruction,
-        identity,
-        candidate,
-        replacement,
-    ) = _runtime_rule()
-    proof = ProofResult.PROVED
-    solve_result = SolveResult(
-        SolveStatus.SOLVED,
-        tree={"kind": "var", "name": "a"},
+@pytest.mark.usefixtures("ida_database")
+class TestCobraProviderPublication:
+    """``mop_t``/``minsn_t`` construction segfaults without an open database."""
+
+    binary_name = _get_default_binary()
+
+    @pytest.mark.parametrize(
+        ("case", "expected_status", "expected_rows"),
+        [
+            ("unavailable", "unavailable", 1),
+            ("unchanged", "unchanged", 1),
+            ("accept_refusal", "unchanged", 1),
+            ("refuted", "proof_failed", 1),
+            ("timeout", "over_budget", 1),
+            ("reconstruction", "reconstruction_failed", 1),
+            ("rejected", "improved", 1),
+            ("accepted", None, 0),
+        ],
     )
-    binding = True
-    accept = True
-    if case == "unavailable":
-        binding = False
-    elif case == "unchanged":
-        solve_result = SolveResult(SolveStatus.UNCHANGED)
-    elif case == "accept_refusal":
-        accept = False
-    elif case == "refuted":
-        proof = ProofResult.REFUTED
-    elif case == "timeout":
-        proof = ProofResult.UNKNOWN
-
-    build = mock.patch.object(cobra_solve, "build_replacement", return_value=replacement)
-    if case == "reconstruction":
-        build = mock.patch.object(
-            cobra_solve,
-            "build_replacement",
-            side_effect=ReconstructionError("test reconstruction failure"),
+    def test_cobra_gates_publish_through_real_outer_lifecycle(self, 
+        case, expected_status, expected_rows
+    ):
+        (
+            store,
+            activation,
+            rule,
+            optimizer,
+            block,
+            instruction,
+            identity,
+            candidate,
+            replacement,
+        ) = _runtime_rule()
+        proof = ProofResult.PROVED
+        solve_result = SolveResult(
+            SolveStatus.SOLVED,
+            tree={"kind": "var", "name": "a"},
         )
-    manager = _manager_for(optimizer)
-    hash_values = iter((1, 1) if case == "rejected" else (1, 2))
-    with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=_Builder()), \
-         mock.patch.object(cobra_solve, "binding_available", return_value=binding), \
-         mock.patch.object(cobra_solve, "solve_signature", return_value=solve_result), \
-         mock.patch.object(cobra_solve, "accept_rewrite", return_value=accept), \
-         mock.patch.object(cobra_solve, "prove_equivalent", return_value=proof), \
-         mock.patch.object(rule._mba_host, "capture_instruction", return_value=candidate), \
-         build, \
-         mock.patch.object(rule, "pending_provider_observation", wraps=rule.pending_provider_observation) as drain, \
-         mock.patch.object(optinsn_adapter, "check_ins_mop_size_are_ok", return_value=True), \
-         mock.patch.object(optinsn_adapter, "count_minsn_nodes", return_value=1), \
-         mock.patch.object(optinsn_adapter, "hash_minsn", side_effect=lambda *_args: next(hash_values)):
-        result = manager.optimize(block, instruction)
-        if case == "rejected":
-            assert result is False
-        elif case == "accepted":
-            assert result is True
-        else:
-            assert result is False
-    assert drain.call_count == 1
+        binding = True
+        accept = True
+        if case == "unavailable":
+            binding = False
+        elif case == "unchanged":
+            solve_result = SolveResult(SolveStatus.UNCHANGED)
+        elif case == "accept_refusal":
+            accept = False
+        elif case == "refuted":
+            proof = ProofResult.REFUTED
+        elif case == "timeout":
+            proof = ProofResult.UNKNOWN
 
-    # No public store query exposes provider attribution; this test-only SQL
-    # assertion is deliberately limited to the row emitted by the real sink.
-    rows = store._connection.execute(
-        """SELECT pa.provider, pa.plugin_name, pa.status,
-                  pa.input_cost_ops, pa.input_cost_nodes,
-                  t.canonical_fingerprint, rt.raw_fingerprint
-             FROM provider_attempts pa
-             JOIN terms t ON t.term_id = pa.term_id
-             JOIN raw_terms rt ON rt.raw_term_id = pa.raw_term_id"""
-    ).fetchall()
-    assert len(rows) == expected_rows
-    if expected_rows:
-        assert rows[0][:3] == ("coefficient_solver", "cobra", expected_status)
-        assert rows[0][3:5] == term_cost(candidate.term)
-        assert rows[0][5] == term_fingerprint(candidate.term)
-        assert rows[0][6] == term_fingerprint(candidate.raw_term)
+        build = mock.patch.object(cobra_solve, "build_replacement", return_value=replacement)
+        if case == "reconstruction":
+            build = mock.patch.object(
+                cobra_solve,
+                "build_replacement",
+                side_effect=ReconstructionError("test reconstruction failure"),
+            )
+        manager = _manager_for(optimizer)
+        hash_values = iter((1, 1) if case == "rejected" else (1, 2))
+        with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=_Builder()), \
+             mock.patch.object(cobra_solve, "binding_available", return_value=binding), \
+             mock.patch.object(cobra_solve, "solve_signature", return_value=solve_result), \
+             mock.patch.object(cobra_solve, "accept_rewrite", return_value=accept), \
+             mock.patch.object(cobra_solve, "prove_equivalent", return_value=proof), \
+             mock.patch.object(rule._mba_host, "capture_instruction", return_value=candidate), \
+             build, \
+             mock.patch.object(rule, "pending_provider_observation", wraps=rule.pending_provider_observation) as drain, \
+             mock.patch.object(optinsn_adapter, "check_ins_mop_size_are_ok", return_value=True), \
+             mock.patch.object(optinsn_adapter, "count_minsn_nodes", return_value=1), \
+             mock.patch.object(optinsn_adapter, "hash_minsn", side_effect=lambda *_args: next(hash_values)):
+            result = manager.optimize(block, instruction)
+            if case == "rejected":
+                assert result is False
+            elif case == "accepted":
+                assert result is True
+            else:
+                assert result is False
+        assert drain.call_count == 1
 
-    activation.close()
-    store.close()
+        # No public store query exposes provider attribution; this test-only SQL
+        # assertion is deliberately limited to the row emitted by the real sink.
+        rows = store._connection.execute(
+            """SELECT pa.provider, pa.plugin_name, pa.status,
+                      pa.input_cost_ops, pa.input_cost_nodes,
+                      t.canonical_fingerprint, rt.raw_fingerprint
+                 FROM provider_attempts pa
+                 JOIN terms t ON t.term_id = pa.term_id
+                 JOIN raw_terms rt ON rt.raw_term_id = pa.raw_term_id"""
+        ).fetchall()
+        assert len(rows) == expected_rows
+        if expected_rows:
+            assert rows[0][:3] == ("coefficient_solver", "cobra", expected_status)
+            assert rows[0][3:5] == term_cost(candidate.term)
+            assert rows[0][5] == term_fingerprint(candidate.term)
+            assert rows[0][6] == term_fingerprint(candidate.raw_term)
+
+        activation.close()
+        store.close()
