@@ -5,15 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 # Must match the PyPI Trusted Publisher registration exactly.
 name = "d810-cobra"
-version = "0.1.5"
+version = "0.1.6"
 description = "CoBRA MBA-solver backend for d810 (mba-solve)"
 readme = "README.md"
-requires-python = ">= 3.10"
+# Tracks d810's own floor. d810-ng 1.0.0b2 (cfg-recon-mainline) requires >=3.11,
+# and this package does nothing without the d810 that discovers it -- a 3.10
+# wheel would install cleanly and then have no host able to load it.
+requires-python = ">= 3.11"
 license = "MIT"
 authors = [{ name = "w00tzenheimer" }]
 keywords = ["deobfuscation", "mba", "ida-pro", "hex-rays", "cobra"]
 classifiers = [
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

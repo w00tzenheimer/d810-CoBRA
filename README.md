@@ -1,7 +1,7 @@
 # d810-cobra
 
 [![ci](https://github.com/w00tzenheimer/d810-CoBRA/actions/workflows/ci.yml/badge.svg)](https://github.com/w00tzenheimer/d810-CoBRA/actions/workflows/ci.yml)
-[![python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](pyproject.toml)
+[![python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](pyproject.toml)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![d810-ng](https://img.shields.io/badge/d810--ng-backend-8A2BE2.svg)](https://github.com/w00tzenheimer/d810-ng)
 
@@ -104,7 +104,7 @@ backends — so this package supplies the `mba-solve` implementation rather than
 overriding one:
 
 ```
-cobra   available   d810-cobra 0.1.5
+cobra   available   d810-cobra 0.1.6
 ```
 
 Check it with `d810cli backends`. Without this package installed, d810's

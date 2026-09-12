@@ -89,7 +89,8 @@ jobs:
                   # This option is scoped to the test environment alone, and it
                   # reaches the manylinux container without a PASS_LINUX entry.
                   CIBW_TEST_ENVIRONMENT: PIP_NO_DEPS=1
-                  CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+                  # No cp310: d810 itself requires >=3.11 (see requires-python).
+                  CIBW_BUILD: "cp311-* cp312-* cp313-*"
                   CIBW_SKIP: "*-win32 *-musllinux_*"
                   CIBW_ENVIRONMENT: >-
                       COBRA_ROOT=/project/third_party/cobra
