@@ -1,4 +1,17 @@
-"""IDA-runtime coverage for CoBRA's D810-owned residual publication seam."""
+"""IDA-runtime coverage for CoBRA's D810-owned residual publication seam.
+
+Everything on d810's side of the seam is real: the process-wide host capability
+registry, entry-point discovery through ``d810.backends.registry()``, a compiled
+pipeline-v2 schedule, native capture of a real ``minsn_t``, the outer
+``InstructionOptimizerManager`` and its mutation commit. This mirrors d810's own
+acceptance test (tests/system/runtime/backends/test_plugin_residual_discovery.py)
+rather than re-assembling d810 internals by hand, which is what the previous
+version of this file did -- and why it broke when those internals moved.
+
+Only CoBRA's own seams are patched, to force each outcome. The ``accepted`` case
+patches nothing: ``x + y - 2*(x & y)`` really solves to ``x ^ y``, is really
+proved, and is really committed by d810.
+"""
 
 # ``ida_hexrays`` is intentionally imported before D810's IDA-coupled modules
 # so local collection reports one skip when the native runtime is unavailable.
@@ -6,10 +19,12 @@
 
 from __future__ import annotations
 
-import dataclasses
+import contextlib
+import importlib.metadata
 import os
 import platform
 from collections import defaultdict
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -17,35 +32,46 @@ import pytest
 
 ida_hexrays = pytest.importorskip("ida_hexrays")
 
-from d810.capabilities.plugin_host import PluginHostCapabilityRegistry
+from d810.backends import _host_capability_registry, registry
+from d810.core.config import ProjectConfiguration
 from d810.core.function_execution_identity import (
     FunctionExecutionIdentity,
     MbaObservationContext,
 )
-from d810.core.plugins import (
-    PluginActivationContext,
-    PluginIdentity,
-    PluginRuleServices,
-)
+from d810.hexrays.expr import ast as ast_dispatcher
+from d810.hexrays.hooks.optinsn_adapter import InstructionOptimizerManager
+from d810.hexrays.ir.mop_snapshot import MopSnapshot
+from d810.ir.maturity import IRMaturity
 from d810.mba.discovery_store import MbaDiscoveryStore
 from d810.mba.extension_api import (
     D810_MBA_RESIDUAL_OBSERVATION_CAPABILITY,
     MbaResidualObservationSink,
-    NativeMbaCandidate,
 )
-from d810.mba.island_profile import profile_typed_term
-from d810_cobra.prove import ProofResult
-from d810_cobra.solve import SolveResult, SolveStatus
-from d810_cobra.convert import ReconstructionError
-from d810.mba.semantic_canonicalization import canonicalize_mba_term
+from d810.mba.native_callback_lease import native_mba_callback_scope
 from d810.mba.residual_observation_sink import SqliteMbaResidualObservationSink
-from d810.mba.typed_term import TypedBvTerm, term_cost, term_fingerprint
 from d810.optimizers.microcode.instructions.handler import InstructionOptimizer
-from d810.hexrays.hooks import optinsn_adapter
-from d810.hexrays.hooks.optinsn_adapter import InstructionOptimizerManager
+from d810.passes.config_v2_hook_runtime import compile_config_v2_hook_schedule
 
-from d810_cobra.plugin import PLUGIN
+from d810_cobra.convert import ReconstructionError
+from d810_cobra.prove import ProofResult
 from d810_cobra.rules import cobra_solve
+from d810_cobra.solve import SolveResult, SolveStatus
+
+try:
+    COBRA_VERSION = importlib.metadata.version("d810-cobra")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover - env guard
+    COBRA_VERSION = None
+
+# Discovery goes through the d810.backends entry point, which only an installed
+# distribution has; a source checkout on PYTHONPATH is invisible to it.
+pytestmark = pytest.mark.skipif(
+    COBRA_VERSION is None, reason="d810-cobra distribution is not installed"
+)
+
+RUNTIME_MATURITY = ida_hexrays.MMAT_PREOPTIMIZED
+FUNCTION_EA = 0x401000
+INSTRUCTION_EA = 0x401002
+BLOCK_SERIAL = 7
 
 
 def _get_default_binary() -> str:
@@ -57,6 +83,37 @@ def _get_default_binary() -> str:
     )
 
 
+def _leaf(name: str, register: int, size: int = 4):
+    leaf = ast_dispatcher.AstLeaf(name)
+    leaf.mop = MopSnapshot(t=ida_hexrays.mop_r, size=size, reg=register)
+    leaf.dest_size = size
+    return leaf
+
+
+def _constant(value: int, size: int = 4):
+    constant = ast_dispatcher.AstConstant(str(value), value, size)
+    constant.mop = MopSnapshot(t=ida_hexrays.mop_n, size=size, value=value)
+    constant.dest_size = size
+    return constant
+
+
+def _node(opcode: int, left, right=None, size: int = 4):
+    node = ast_dispatcher.AstNode(opcode, left, right)
+    node.dest_size = size
+    return node
+
+
+def _mba_instruction():
+    """A real native ``out = (x + y) + (-2 * (x & y))``, which equals ``x ^ y``."""
+    common_sum = _node(ida_hexrays.m_add, _leaf("x", 1), _leaf("y", 2))
+    common_and = _node(ida_hexrays.m_and, _leaf("x", 1), _leaf("y", 2))
+    coefficient = _node(ida_hexrays.m_mul, _constant(-2), common_and)
+    destination = _leaf("out", 7).create_mop(INSTRUCTION_EA)
+    return _node(ida_hexrays.m_add, common_sum, coefficient).create_minsn(
+        INSTRUCTION_EA, destination
+    )
+
+
 class _Optimizer(InstructionOptimizer):
     RULE_CLASSES = [object]
 
@@ -65,148 +122,173 @@ class _Optimizer(InstructionOptimizer):
         return True
 
 
-def _manager_for(optimizer):
+def _context(identity) -> MbaObservationContext:
+    return MbaObservationContext(
+        function_identity=FunctionExecutionIdentity(
+            input_identity="sha256:" + "c" * 64,
+            input_identity_provenance="verified_loader_sha256",
+            external_evidence_allowed=True,
+            database_uuid="12345678-1234-5678-1234-567812345678",
+            database_identity="cobra-publication-idb",
+            function_ea=FUNCTION_EA,
+            function_rva=0x1000,
+            function_fingerprint="cobra-publication-function",
+            decompilation_session_id="12345678-1234-5678-1234-567812345679",
+            top_level_epoch=1,
+            maturity=IRMaturity.CANONICAL.value,
+            evidence_generation=1,
+        ),
+        plugin_identity=identity,
+        instruction_ea=INSTRUCTION_EA,
+        block_serial=BLOCK_SERIAL,
+        block_ea=FUNCTION_EA,
+    )
+
+
+def _manager(optimizer):
+    """The outer optimizer, shaped exactly as d810's acceptance test builds it."""
     manager = InstructionOptimizerManager.__new__(InstructionOptimizerManager)
-    manager.current_maturity = ida_hexrays.MMAT_PREOPTIMIZED
+    manager.current_maturity = RUNTIME_MATURITY
     manager._active_optimizers = [optimizer]
     manager._last_optimizer_tried = None
     manager._rewrite_seen = defaultdict(set)
     manager._cycle_quarantined_rule_names = defaultdict(set)
     manager._scheduled_implementation_names = frozenset()
-    manager._resolve_active_instruction_rule_names = lambda _blk: None
+    manager._resolve_active_instruction_rule_names = lambda _block: None
     manager._residual_admission_cache_key = None
     manager._residual_admission_cache_value = False
-    manager.analyzer = SimpleNamespace(analyze=lambda _blk, _ins: None)
+    manager.analyzer = SimpleNamespace(analyze=lambda _block, _instruction: None)
     manager.stats = None
     manager.generate_z3_code = False
-    manager.mba_observation_context = lambda _blk, _ins, identity: _context(identity)
+    manager.mba_observation_context = lambda _block, _instruction, identity: _context(
+        identity
+    )
     return manager
 
 
-def _context(identity: PluginIdentity) -> MbaObservationContext:
-    function_identity = FunctionExecutionIdentity(
-        input_identity="idb-local:12345678-1234-5678-1234-567812345678",
-        input_identity_provenance="current_idb",
-        external_evidence_allowed=False,
-        database_uuid="12345678-1234-5678-1234-567812345678",
-        database_identity="cobra-task9",
-        function_ea=0x401000,
-        function_rva=0x1000,
-        function_fingerprint="cobra-task9-function",
-        decompilation_session_id="12345678-1234-5678-1234-567812345679",
-        top_level_epoch=1,
-        maturity="ir.canonical",
-        evidence_generation=1,
-    )
-    return MbaObservationContext(
-        function_identity=function_identity,
-        plugin_identity=identity,
-        instruction_ea=0x401002,
-        block_serial=7,
-        block_ea=0x401000,
+def _block():
+    return SimpleNamespace(
+        mba=SimpleNamespace(maturity=RUNTIME_MATURITY, entry_ea=FUNCTION_EA),
+        serial=BLOCK_SERIAL,
     )
 
 
-def _candidate():
-    raw = TypedBvTerm(
-        "sub",
-        32,
-        children=(
-            TypedBvTerm(
-                "or",
-                32,
-                children=(
-                    TypedBvTerm(None, 32, leaf_key=("a",)),
-                    TypedBvTerm(None, 32, leaf_key=("b",)),
-                ),
-            ),
-            TypedBvTerm(
-                "and",
-                32,
-                children=(
-                    TypedBvTerm(None, 32, leaf_key=("a",)),
-                    TypedBvTerm(None, 32, leaf_key=("b",)),
-                ),
-            ),
-        ),
-    )
-    canonical = canonicalize_mba_term(raw).canonical_term
-    profile = dataclasses.replace(
-        profile_typed_term(raw), fingerprint=term_fingerprint(canonical)
-    )
-    return NativeMbaCandidate(
-        destination_size=4,
-        term=canonical,
-        raw_term=raw,
-        profile=profile,
-        native_context=object(),
-    )
+@contextlib.contextmanager
+def _real_cobra_rule(store: MbaDiscoveryStore):
+    """Activate cobra-solve through d810's real registry; always clean up.
 
-
-class _Snapshot:
-    size = 4
-
-
-class _Builder:
-    snapshots = {"a": _Snapshot(), "b": _Snapshot()}
-    # Mirrors detect._TreeBuilder: every operand and the destination are 4
-    # bytes, so the rule stays on its same-width path and never width-lifts.
-    source_widths = {4}
-
-    def instruction(self, _instruction):
-        return {
-            "kind": "bin",
-            "op": "-",
-            "a": {
-                "kind": "bin",
-                "op": "|",
-                "a": {"kind": "var", "name": "a"},
-                "b": {"kind": "var", "name": "b"},
-            },
-            "b": {
-                "kind": "bin",
-                "op": "&",
-                "a": {"kind": "var", "name": "a"},
-                "b": {"kind": "var", "name": "b"},
-            },
-        }
-
-
-def _runtime_rule():
-    store = MbaDiscoveryStore(":memory:")
+    The capability lease is taken first and released in ``finally`` no matter
+    where activation fails. Registering it and then raising before cleanup is
+    set up would leave ``d810.mba.residual-observation.v1`` registered on the
+    process-wide host registry, and every later test in the interpreter that
+    starts a D810Manager would fail with "already registered".
+    """
     sink = SqliteMbaResidualObservationSink(store)
-    host = PluginHostCapabilityRegistry()
-    host.register(
+    lease = _host_capability_registry().register(
         D810_MBA_RESIDUAL_OBSERVATION_CAPABILITY,
         MbaResidualObservationSink,
         sink,
         activation_binder=sink.bind_activation,
+        implementation_binder=sink.bind_implementation,
     )
-    identity = PluginIdentity("cobra", "d810-cobra", "1.0", "task9-runtime")
-    activation_host = host.view_for(
-        (D810_MBA_RESIDUAL_OBSERVATION_CAPABILITY,), identity
-    )
-    activation = PLUGIN.activate(PluginActivationContext(identity, activation_host))
-    rule = activation.create_implementation("cobra-solve")
-    rule.bind_plugin_services(PluginRuleServices(identity, activation_host))
-    candidate = _candidate()
-    replacement = ida_hexrays.minsn_t(0x401002)
-    replacement.opcode = ida_hexrays.m_mov
-    rule._ensure_store = lambda: None
-    optimizer = _Optimizer([ida_hexrays.MMAT_PREOPTIMIZED], stats=None)
-    rule.maturities = [ida_hexrays.MMAT_PREOPTIMIZED]
-    optimizer.add_rule(rule)
-    block = SimpleNamespace(
-        mba=SimpleNamespace(
-            maturity=ida_hexrays.MMAT_PREOPTIMIZED,
-            entry_ea=0x401000,
-        ),
-        serial=7,
-    )
-    instruction = ida_hexrays.minsn_t(0x401002)
-    instruction.opcode = ida_hexrays.m_mov
-    instruction.d.make_number(0, 4)
-    return store, activation, rule, optimizer, block, instruction, identity, candidate, replacement
+    backends = None
+    try:
+        schedule = compile_config_v2_hook_schedule(
+            ProjectConfiguration(
+                path=Path("cobra-publication.runtime-config-v2.json"),
+                additional_configuration={
+                    "pipeline_v2": [
+                        {
+                            "pass_id": "mba-solve",
+                            "options": {
+                                "maturities": ["CANONICAL"],
+                                "require_proof": True,
+                                "max_leaves": 8,
+                            },
+                        }
+                    ]
+                },
+            )
+        )
+        binding = next(
+            item for item in schedule.instruction_bindings if item.pass_id == "mba-solve"
+        )
+        backends = registry()
+        candidate = backends.require_unique_implementation(
+            "mba-solve", install_hint="d810-cobra"
+        )
+        assert candidate.rule_name == binding.implementation_id
+        rule = backends.activate_implementation(candidate)
+        rule.bind_plugin_services(backends.plugin_rule_services(candidate))
+        rule.configure(dict(binding.config))
+        # The durable proof cache is keyed by the expression tree, and every
+        # case uses the same tree: a PROVED entry left by one case would let a
+        # later case skip the very gate it exists to exercise.
+        rule._ensure_store = lambda: None
+        assert rule.maturities == [RUNTIME_MATURITY]
+        yield rule
+    finally:
+        if backends is not None:
+            backends.close_activations()
+        lease.release()
+        sink.close()
+
+
+@contextlib.contextmanager
+def _drained_observations(rule):
+    """Record what d810's outer optimizer drains from the rule.
+
+    The manager calls ``pending_provider_observation()`` exactly once per
+    attempt, after deciding whether to commit. What it receives is the outcome
+    CoBRA reported, including ``applied`` -- which the sink deliberately never
+    stores as a residual row, so the store alone cannot show it.
+    """
+    drained = []
+    real = rule.pending_provider_observation
+
+    def spy():
+        observation = real()
+        drained.append(observation)
+        return observation
+
+    with mock.patch.object(rule, "pending_provider_observation", side_effect=spy):
+        yield drained
+
+
+def _refusal_patches(case: str, instruction):
+    if case == "unavailable":
+        return [mock.patch.object(cobra_solve, "binding_available", return_value=False)]
+    if case == "unchanged":
+        return [
+            mock.patch.object(
+                cobra_solve, "solve_signature", return_value=SolveResult(SolveStatus.UNCHANGED)
+            )
+        ]
+    if case == "accept_refusal":
+        return [mock.patch.object(cobra_solve, "accept_rewrite", return_value=False)]
+    if case == "refuted":
+        return [mock.patch.object(cobra_solve, "prove_equivalent", return_value=ProofResult.REFUTED)]
+    if case == "timeout":
+        return [mock.patch.object(cobra_solve, "prove_equivalent", return_value=ProofResult.UNKNOWN)]
+    if case == "reconstruction":
+        return [
+            mock.patch.object(
+                cobra_solve,
+                "build_replacement",
+                side_effect=ReconstructionError("test reconstruction failure"),
+            )
+        ]
+    if case == "rejected":
+        # A replacement identical to the input: CoBRA reports an improvement,
+        # and d810's outer optimizer, seeing no change, declines to apply it.
+        return [
+            mock.patch.object(
+                cobra_solve,
+                "build_replacement",
+                side_effect=lambda *_args, **_kwargs: ida_hexrays.minsn_t(instruction),
+            )
+        ]
+    raise AssertionError(case)
 
 
 @pytest.mark.usefixtures("ida_database")
@@ -216,95 +298,59 @@ class TestCobraProviderPublication:
     binary_name = _get_default_binary()
 
     @pytest.mark.parametrize(
-        ("case", "expected_status", "expected_rows"),
+        ("case", "expected_status"),
         [
-            ("unavailable", "unavailable", 1),
-            ("unchanged", "unchanged", 1),
-            ("accept_refusal", "unchanged", 1),
-            ("refuted", "proof_failed", 1),
-            ("timeout", "over_budget", 1),
-            ("reconstruction", "reconstruction_failed", 1),
-            ("rejected", "improved", 1),
-            ("accepted", None, 0),
+            ("unavailable", "unavailable"),
+            ("unchanged", "unchanged"),
+            ("accept_refusal", "unchanged"),
+            ("refuted", "proof_failed"),
+            ("timeout", "over_budget"),
+            ("reconstruction", "reconstruction_failed"),
+            ("rejected", "improved"),
         ],
     )
-    def test_cobra_gates_publish_through_real_outer_lifecycle(self, 
-        case, expected_status, expected_rows
-    ):
-        (
-            store,
-            activation,
-            rule,
-            optimizer,
-            block,
-            instruction,
-            identity,
-            candidate,
-            replacement,
-        ) = _runtime_rule()
-        proof = ProofResult.PROVED
-        solve_result = SolveResult(
-            SolveStatus.SOLVED,
-            tree={"kind": "var", "name": "a"},
-        )
-        binding = True
-        accept = True
-        if case == "unavailable":
-            binding = False
-        elif case == "unchanged":
-            solve_result = SolveResult(SolveStatus.UNCHANGED)
-        elif case == "accept_refusal":
-            accept = False
-        elif case == "refuted":
-            proof = ProofResult.REFUTED
-        elif case == "timeout":
-            proof = ProofResult.UNKNOWN
+    def test_refused_outcome_publishes_one_attributed_attempt(
+        self, tmp_path: Path, case: str, expected_status: str
+    ) -> None:
+        assert ida_hexrays.init_hexrays_plugin()
+        instruction = _mba_instruction()
+        # The sink owns the store and closes it on cleanup, so every store
+        # assertion happens inside the activation.
+        store = MbaDiscoveryStore(tmp_path / f"{case}.sqlite3")
+        with _real_cobra_rule(store) as rule, contextlib.ExitStack() as patches:
+            for patch in _refusal_patches(case, instruction):
+                patches.enter_context(patch)
+            optimizer = _Optimizer([RUNTIME_MATURITY], stats=None)
+            optimizer.add_rule(rule)
+            with _drained_observations(rule) as drained, native_mba_callback_scope():
+                assert _manager(optimizer).optimize(_block(), instruction) is False
 
-        build = mock.patch.object(cobra_solve, "build_replacement", return_value=replacement)
-        if case == "reconstruction":
-            build = mock.patch.object(
-                cobra_solve,
-                "build_replacement",
-                side_effect=ReconstructionError("test reconstruction failure"),
-            )
-        manager = _manager_for(optimizer)
-        hash_values = iter((1, 1) if case == "rejected" else (1, 2))
-        with mock.patch.object(cobra_solve, "_TreeBuilder", return_value=_Builder()), \
-             mock.patch.object(cobra_solve, "binding_available", return_value=binding), \
-             mock.patch.object(cobra_solve, "solve_signature", return_value=solve_result), \
-             mock.patch.object(cobra_solve, "accept_rewrite", return_value=accept), \
-             mock.patch.object(cobra_solve, "prove_equivalent", return_value=proof), \
-             mock.patch.object(rule._mba_host, "capture_instruction", return_value=candidate), \
-             build, \
-             mock.patch.object(rule, "pending_provider_observation", wraps=rule.pending_provider_observation) as drain, \
-             mock.patch.object(optinsn_adapter, "check_ins_mop_size_are_ok", return_value=True), \
-             mock.patch.object(optinsn_adapter, "count_minsn_nodes", return_value=1), \
-             mock.patch.object(optinsn_adapter, "hash_minsn", side_effect=lambda *_args: next(hash_values)):
-            result = manager.optimize(block, instruction)
-            if case == "rejected":
-                assert result is False
-            elif case == "accepted":
-                assert result is True
-            else:
-                assert result is False
-        assert drain.call_count == 1
+            assert len(drained) == 1
+            assert drained[0].outcome.status.value == expected_status
+            snapshots = store.provider_attempt_snapshots()
+            assert len(snapshots) == 1
+            attempt = snapshots[0].attempt
+            assert attempt.outcome.status.value == expected_status
+            assert attempt.outcome.provider.value == "coefficient_solver"
+            assert attempt.context.plugin_identity.name == "cobra"
+            assert attempt.context.plugin_identity.distribution == "d810-cobra"
+            assert attempt.context.plugin_identity.version == COBRA_VERSION
+            assert attempt.context.instruction_ea == INSTRUCTION_EA
+            assert attempt.context.block_serial == BLOCK_SERIAL
+            assert attempt.outcome.input_cost is not None
 
-        # No public store query exposes provider attribution; this test-only SQL
-        # assertion is deliberately limited to the row emitted by the real sink.
-        rows = store._connection.execute(
-            """SELECT pa.provider, pa.plugin_name, pa.status,
-                      pa.input_cost_ops, pa.input_cost_nodes,
-                      t.canonical_fingerprint, rt.raw_fingerprint
-                 FROM provider_attempts pa
-                 JOIN terms t ON t.term_id = pa.term_id
-                 JOIN raw_terms rt ON rt.raw_term_id = pa.raw_term_id"""
-        ).fetchall()
-        assert len(rows) == expected_rows
-        if expected_rows:
-            assert rows[0][:3] == ("coefficient_solver", "cobra", expected_status)
-            assert rows[0][3:5] == term_cost(candidate.term)
-            assert rows[0][5] == term_fingerprint(candidate.term)
-            assert rows[0][6] == term_fingerprint(candidate.raw_term)
+    def test_accepted_rewrite_is_applied_without_residual_row(self, tmp_path: Path) -> None:
+        assert ida_hexrays.init_hexrays_plugin()
+        instruction = _mba_instruction()
+        before = instruction.dstr()
+        store = MbaDiscoveryStore(tmp_path / "accepted.sqlite3")
+        with _real_cobra_rule(store) as rule:
+            optimizer = _Optimizer([RUNTIME_MATURITY], stats=None)
+            optimizer.add_rule(rule)
+            with _drained_observations(rule) as drained, native_mba_callback_scope():
+                assert _manager(optimizer).optimize(_block(), instruction) is True
 
-        activation.close()
-        store.close()
+            assert len(drained) == 1
+            assert drained[0].outcome.status.value == "applied"
+            assert store.provider_attempt_snapshots() == ()
+        assert instruction.dstr() != before
