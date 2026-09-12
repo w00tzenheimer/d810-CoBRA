@@ -20,7 +20,9 @@ jobs:
         strategy:
             fail-fast: false
             matrix:
-                python: ["3.10", "3.13"]
+                # 3.11 is the floor because d810 is: cfg-recon-mainline declares
+                # requires-python >=3.11, so a 3.10 job cannot install the host.
+                python: ["3.11", "3.13"]
         steps:
             - uses: actions/checkout@v4
 
@@ -31,7 +33,54 @@ jobs:
             # d810-ng is a real runtime dependency -- solve.py, table.py,
             # convert.py and detect.py all import it -- so the tests need it
             # even though they never touch the compiled extension.
-            - run: pip install pytest "d810-ng>=0.6.6"
+            #
+            # From cfg-recon-mainline, NOT PyPI. The newest PyPI release is
+            # 0.6.6, which predates d810.core.plugins entirely, so testing
+            # against it failed on missing host modules and said nothing about
+            # this package -- every push to main was red for that reason alone.
+            # cfg-recon-mainline is the d810 this backend is written against.
+            #
+            # The branch is resolved to a commit once and installed by SHA, so
+            # the log states exactly which d810 a run tested. A branch name
+            # alone would make a red run unreproducible the moment the branch
+            # moves.
+            - name: Resolve d810 cfg-recon-mainline
+              id: d810
+              run: |
+                  sha=$(git ls-remote https://github.com/w00tzenheimer/d810-ng.git refs/heads/cfg-recon-mainline | cut -f1)
+                  if [ -z "$sha" ]; then
+                      echo "::error::d810-ng has no cfg-recon-mainline branch"
+                      exit 1
+                  fi
+                  echo "sha=$sha" >> "$GITHUB_OUTPUT"
+                  echo "d810-ng cfg-recon-mainline @ \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+            # z3-solver explicitly: the proof gate (prove.py, width_prove.py) is
+            # tested for real PROVED / REFUTED verdicts, and d810 does not
+            # depend on z3 -- inside IDA it is installed on demand into
+            # ~/.d810-speedups. Without it every proof reports UNAVAILABLE and
+            # those tests fail on an environment fact.
+            #
+            # d810 installs pure-Python here: its setup.py builds the Cython
+            # speedups only when D810_BUILD_SPEEDUPS=1, so no IDA SDK or
+            # compiler is needed.
+            - run: >-
+                  pip install pytest z3-solver
+                  "d810-ng @ https://github.com/w00tzenheimer/d810-ng/archive/${{ steps.d810.outputs.sha }}.tar.gz"
+
+            # Fail on the seam before running anything: a d810 without
+            # d810.core.plugins would otherwise surface as a pile of unrelated
+            # test failures, which is exactly how the PyPI pin hid for weeks.
+            - name: d810 carries the API-1 plugin seam
+              run: |
+                  python - <<'PY'
+                  import d810
+                  from d810.core.plugins import PLUGIN_API_VERSION
+                  from d810.mba.extension_api import D810_MBA_RESIDUAL_OBSERVATION_CAPABILITY
+                  print("d810", d810.__version__, "PLUGIN_API_VERSION", PLUGIN_API_VERSION)
+                  assert PLUGIN_API_VERSION == 1, PLUGIN_API_VERSION
+                  assert D810_MBA_RESIDUAL_OBSERVATION_CAPABILITY == "d810.mba.residual-observation.v1"
+                  PY
 
             # No `pip install .` -- that would trigger the extension build and
             # need the whole CoBRA toolchain. The solver logic under test is
