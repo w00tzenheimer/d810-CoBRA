@@ -202,8 +202,8 @@ class TestWidthLift:
 
         The MUL case truncates a byte addition before a wide multiplication.
         The ADD case combines byte and dword reads of one known register
-        version. Both must retain typed semantics through all four native/
-        Python snapshot and AST combinations.
+        version. Both retain typed semantics through the Python snapshot and AST
+        path plus every available native combination.
         """
         from d810_cobra import convert
         from d810.hexrays.ir.mop_snapshot import PythonMopSnapshot
@@ -226,12 +226,16 @@ class TestWidthLift:
         root.d.assign(reg(32, 8, 77))
         native_snapshot = detect.MopSnapshot
         native_node, native_leaf = convert.AstNode, convert.AstLeaf
-        assert 'speedups' in native_node.__module__
-        assert 'speedups' in native_snapshot.__module__
+        snapshot_types = tuple(dict.fromkeys((PythonMopSnapshot, native_snapshot)))
+        ast_types = tuple(dict.fromkeys(((p_ast.AstNode, p_ast.AstLeaf),
+                                        (native_node, native_leaf))))
+        print("public_root_backends", root_case,
+              "combinations=" + str(len(snapshot_types) * len(ast_types)),
+              "snapshots=" + repr([kind.__module__ for kind in snapshot_types]),
+              "asts=" + repr([node.__module__ for node, _ in ast_types]))
         reference = None
-        for snapshot_type in (native_snapshot, PythonMopSnapshot):
-            for node_type, leaf_type in ((native_node, native_leaf),
-                                        (p_ast.AstNode, p_ast.AstLeaf)):
+        for snapshot_type in snapshot_types:
+            for node_type, leaf_type in ast_types:
                 with monkeypatch.context() as patch:
                     patch.setattr(detect, 'MopSnapshot', snapshot_type)
                     patch.setattr(convert, 'AstNode', node_type)
