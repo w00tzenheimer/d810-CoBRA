@@ -1,16 +1,13 @@
-"""IDA-runtime coverage for CoBRA's D810-owned residual publication seam.
+"""Native CoBRA solve/proof and D810 residual-publication seam coverage.
 
-Everything on d810's side of the seam is real: the process-wide host capability
-registry, entry-point discovery through ``d810.backends.registry()``, a compiled
-pipeline-v2 schedule, native capture of a real ``minsn_t``, the outer
-``InstructionOptimizerManager`` and its mutation commit. This mirrors d810's own
-acceptance test (tests/system/runtime/backends/test_plugin_residual_discovery.py)
-rather than re-assembling d810 internals by hand, which is what the previous
-version of this file did -- and why it broke when those internals moved.
-
-Only CoBRA's own seams are patched, to force each outcome. The ``accepted`` case
-patches nothing: ``x + y - 2*(x & y)`` really solves to ``x ^ y``, is really
-proved, and is really committed by d810.
+The host capability registry, entry-point discovery, compiled pipeline-v2
+schedule, native minsn_t capture, solver, proof, and outer mutation commit are
+real. The outer manager is constructed with __new__ and configured by this
+harness; its block and observation identity are synthetic. The durable proof
+cache is disabled and observation draining is spied on for every case. Refusal
+cases additionally patch the named CoBRA outcome gate. The accepted case keeps
+solve, proof, reconstruction, and commit unpatched and checks the exact XOR.
+This does not exercise manager lifecycle or whole-function decompilation.
 """
 
 # ``ida_hexrays`` is intentionally imported before D810's IDA-coupled modules
@@ -112,6 +109,20 @@ def _mba_instruction():
     return _node(ida_hexrays.m_add, common_sum, coefficient).create_minsn(
         INSTRUCTION_EA, destination
     )
+
+
+def _register_identity(operand):
+    return operand.t, operand.r, operand.size, operand.valnum
+
+
+def _assert_exact_xor(instruction, destination_identity):
+    """Pin the committed opcode, both source locations/widths, and destination."""
+    assert instruction.opcode == ida_hexrays.m_xor
+    assert sorted((_register_identity(instruction.l),
+                   _register_identity(instruction.r))) == [
+        (ida_hexrays.mop_r, 1, 4, 0), (ida_hexrays.mop_r, 2, 4, 0)
+    ]
+    assert _register_identity(instruction.d) == destination_identity
 
 
 class _Optimizer(InstructionOptimizer):
@@ -228,10 +239,14 @@ def _real_cobra_rule(store: MbaDiscoveryStore):
         assert rule.maturities == [RUNTIME_MATURITY]
         yield rule
     finally:
-        if backends is not None:
-            backends.close_activations()
-        lease.release()
-        sink.close()
+        try:
+            if backends is not None:
+                backends.close_activations()
+        finally:
+            try:
+                lease.release()
+            finally:
+                sink.close()
 
 
 @contextlib.contextmanager
@@ -342,7 +357,7 @@ class TestCobraProviderPublication:
     def test_accepted_rewrite_is_applied_without_residual_row(self, tmp_path: Path) -> None:
         assert ida_hexrays.init_hexrays_plugin()
         instruction = _mba_instruction()
-        before = instruction.dstr()
+        destination_identity = _register_identity(instruction.d)
         store = MbaDiscoveryStore(tmp_path / "accepted.sqlite3")
         with _real_cobra_rule(store) as rule:
             optimizer = _Optimizer([RUNTIME_MATURITY], stats=None)
@@ -353,4 +368,44 @@ class TestCobraProviderPublication:
             assert len(drained) == 1
             assert drained[0].outcome.status.value == "applied"
             assert store.provider_attempt_snapshots() == ()
-        assert instruction.dstr() != before
+        _assert_exact_xor(instruction, destination_identity)
+
+    @pytest.mark.parametrize("mutation", ["opcode", "source", "source_width",
+                                           "destination", "destination_width",
+                                           "destination_version"])
+    def test_exact_xor_assertion_rejects_mutants(self, mutation):
+        instruction = _node(ida_hexrays.m_xor, _leaf("x", 1), _leaf("y", 2)).create_minsn(
+            INSTRUCTION_EA, _leaf("out", 7).create_mop(INSTRUCTION_EA)
+        )
+        destination_identity = _register_identity(instruction.d)
+        _assert_exact_xor(instruction, destination_identity)
+        if mutation == "opcode":
+            instruction.opcode = ida_hexrays.m_or
+        elif mutation == "source":
+            instruction.l.make_reg(3, 4)
+        elif mutation == "source_width":
+            instruction.l.size = 8
+        elif mutation == "destination":
+            instruction.d.make_reg(8, 4)
+        elif mutation == "destination_width":
+            instruction.d.size = 8
+        else:
+            instruction.d.valnum = 42
+        with pytest.raises(AssertionError):
+            _assert_exact_xor(instruction, destination_identity)
+
+    def test_activation_and_cleanup_failure_still_release_capability(self, tmp_path):
+        store = MbaDiscoveryStore(tmp_path / "activation-failure.sqlite3")
+        backend = mock.Mock()
+        backend.require_unique_implementation.return_value.rule_name = "cobra-solve"
+        backend.activate_implementation.side_effect = RuntimeError("activation failed")
+        backend.close_activations.side_effect = RuntimeError("cleanup failed")
+        with mock.patch(__name__ + ".registry", return_value=backend):
+            with pytest.raises(RuntimeError, match="cleanup failed") as failure:
+                with _real_cobra_rule(store):
+                    pytest.fail("activation unexpectedly succeeded")
+        assert str(failure.value.__context__) == "activation failed"
+        # Acquiring this same process-wide capability again proves the failed
+        # activation released its lease, even when backend cleanup also raised.
+        with _real_cobra_rule(MbaDiscoveryStore(tmp_path / "after-failure.sqlite3")):
+            pass

@@ -18,18 +18,43 @@ def _get_default_binary() -> str:
     )
 
 
+@pytest.fixture
+def public_native_mba(ida_database):
+    """Own a real MBA from the public libobfuscated fixture through the SDK."""
+    import ida_funcs
+    import ida_idaapi
+    import ida_name
+    import ida_nalt
+
+    assert hx.init_hexrays_plugin()
+    ea = ida_name.get_name_ea(ida_idaapi.BADADDR, "test_xor")
+    if ea == ida_idaapi.BADADDR:
+        ea = ida_name.get_name_ea(ida_idaapi.BADADDR, "_test_xor")
+    function = ida_funcs.get_func(ea)
+    assert function is not None, "public fixture must export test_xor"
+    failure = hx.hexrays_failure_t()
+    mba = hx.gen_microcode(hx.mba_ranges_t(function), failure, None,
+                          hx.DECOMP_NO_WAIT, hx.MMAT_GENERATED)
+    assert mba is not None, str(failure)
+    print("public_native_mba", ida_nalt.get_input_file_path(),
+          "sha256=" + ida_nalt.retrieve_input_file_sha256().hex(),
+          "function_ea=" + hex(ea), "maturity=" + str(mba.maturity))
+    yield mba
+
+
 def _native_mba(request):
     """The host suite's ``native_mba``, or an explicit skip naming it.
 
-    These cases pin EAs from one specific binary, so they cannot build their own
-    mba_t from whatever database happens to be open. Resolving the fixture by
-    name, rather than declaring it here, leaves a host conftest that does
-    provide it in charge -- a local definition would shadow it.
+    Only the historical saved-root case uses this external fixture. Its two
+    private EAs were committed without a binary or serialized expression. The
+    public fixtures below cover explicit width and alias invariants, but cannot
+    establish acceptance for those original roots. Keep this unresolved case
+    collected so the missing evidence stays visible.
     """
     try:
         return request.getfixturevalue("native_mba")
     except pytest.FixtureLookupError:
-        pytest.skip("needs a native_mba fixture (an mba_t for the binary whose EAs this case pins)")
+        pytest.skip("original saved roots at 0x18F557265BF/0x18F55734E71 remain unverified: native_mba fixture absent")
 
 
 def reg(location, size, version=1):
@@ -147,13 +172,13 @@ class TestWidthLift:
         assert len(capture.snapshots) == 1
 
     @pytest.mark.parametrize('kind', ['global', 'stack'])
-    def test_narrow_nonregister_read_is_preserved(self, kind, request):
+    def test_narrow_nonregister_read_is_preserved(self, kind, public_native_mba):
         from d810_cobra.convert import tree_to_ast
         from d810.hexrays.ir.mop_snapshot import MopSnapshot
-        native_mba = _native_mba(request)
+        native_mba = public_native_mba
         source = hx.mop_t()
         if kind == 'global':
-            source.make_gvar(0x18F5575CD50)
+            source.make_gvar(native_mba.entry_ea)
         else:
             source.make_stkvar(native_mba, 0)
         source.size = 1
@@ -164,6 +189,79 @@ class TestWidthLift:
         assert result.d.l.size == 1 and result.d.l.t == source.t
         assert result.d.l.dstr() == before
         assert snapshot.size == 1 and snapshot.to_mop().dstr() == before
+        if kind == 'global':
+            assert result.d.l.g == source.g == native_mba.entry_ea
+        else:
+            assert result.d.l.s.off == source.s.off == 0
+
+    @pytest.mark.parametrize('root_case', ['narrow_mul', 'alias_add'])
+    def test_public_roots_python_cython_snapshot_and_ast_parity(
+        self, monkeypatch, public_native_mba, root_case
+    ):
+        """Owned semantic fixtures; not replicas of the unavailable saved EAs.
+
+        The MUL case truncates a byte addition before a wide multiplication.
+        The ADD case combines byte and dword reads of one known register
+        version. Both must retain typed semantics through all four native/
+        Python snapshot and AST combinations.
+        """
+        from d810_cobra import convert
+        from d810.hexrays.ir.mop_snapshot import PythonMopSnapshot
+        from d810.hexrays.expr import p_ast
+
+        def nested(ins):
+            op = hx.mop_t()
+            op.create_from_insn(ins)
+            return op
+
+        number = hx.mop_t()
+        number.make_number(255 if root_case == 'narrow_mul' else 1, 1)
+        narrow = instruction(hx.m_add if root_case == 'narrow_mul' else hx.m_xor,
+                             reg(8, 1, 66), number, size=1)
+        extended = nested(instruction(hx.m_xdu, nested(narrow)))
+        root = instruction(hx.m_mul if root_case == 'narrow_mul' else hx.m_add,
+                           extended, reg(16, 8, 67) if root_case == 'narrow_mul'
+                           else reg(8, 4, 66))
+        root.ea = public_native_mba.entry_ea
+        root.d.assign(reg(32, 8, 77))
+        native_snapshot = detect.MopSnapshot
+        native_node, native_leaf = convert.AstNode, convert.AstLeaf
+        assert 'speedups' in native_node.__module__
+        assert 'speedups' in native_snapshot.__module__
+        reference = None
+        for snapshot_type in (native_snapshot, PythonMopSnapshot):
+            for node_type, leaf_type in ((native_node, native_leaf),
+                                        (p_ast.AstNode, p_ast.AstLeaf)):
+                with monkeypatch.context() as patch:
+                    patch.setattr(detect, 'MopSnapshot', snapshot_type)
+                    patch.setattr(convert, 'AstNode', node_type)
+                    patch.setattr(convert, 'AstLeaf', leaf_type)
+                    capture = builder()
+                    normalized = capture.instruction(root)
+                    candidate = detect.MbaCandidate(root.ea, 0, normalized,
+                        tuple(capture.snapshots), capture.snapshots, 8)
+                    rebuilt = convert.build_replacement(candidate, normalized, root)
+                    assert (rebuilt.d.t, rebuilt.d.r, rebuilt.d.size, rebuilt.d.valnum) == (
+                        hx.mop_r, 32, 8, 77)
+                    rebuilt_capture = builder()
+                    rebuilt_tree = rebuilt_capture.instruction(rebuilt)
+                    for x in (0, 1, 255, 256, 0x12345678, 0xffffffff):
+                        expected = (((x & 255) + 255) & 255) * 3 if root_case == 'narrow_mul' else (
+                            ((x & 255) ^ 1) + (x & 0xffffffff))
+                        for tree, snapshots in ((normalized, capture.snapshots),
+                                                (rebuilt_tree, rebuilt_capture.snapshots)):
+                            values = {name: x if snap.reg == 8 else 3
+                                      for name, snap in snapshots.items()}
+                            assert evaluate(tree, values, (1 << 64) - 1) == expected
+                    actual = (normalized, rebuilt.dstr(),
+                              [(snap.size, snap.reg, snap.valnum)
+                               for snap in capture.snapshots.values()])
+                    if reference is None:
+                        reference = actual
+                    assert actual == reference
+                    if root_case == 'alias_add':
+                        assert len(capture.snapshots) == 1
+                        assert next(iter(capture.snapshots.values())).size == 4
 
     @pytest.mark.parametrize('proof', ['proved', 'unknown', 'unavailable', 'refuted'])
     def test_new_width_domain_requires_real_proof_even_when_disabled(self, monkeypatch, proof):
