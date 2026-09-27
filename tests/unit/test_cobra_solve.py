@@ -122,6 +122,15 @@ class TestSolveSignature(unittest.TestCase):
         self.assertIs(result.status, SolveStatus.FAILED)
         self.assertTrue(result.reason)
 
+    def test_expired_budget_is_not_a_negative_result(self):
+        tree = _tree("(x0 | x1) - (x0 & x1)", ["a", "b"])
+        expired = solve_signature(tree, ["a", "b"], 32, time_limit_ms=0)
+        self.assertIs(expired.status, SolveStatus.EXPIRED)
+        self.assertTrue(expired.expired)
+        self.assertIsNone(expired.tree)
+        retried = solve_signature(tree, ["a", "b"], 32, time_limit_ms=1000)
+        self.assertIs(retried.status, SolveStatus.SOLVED)
+
 
 @unittest.skipUnless(
     binding_available() and find_cobra_cli().available,

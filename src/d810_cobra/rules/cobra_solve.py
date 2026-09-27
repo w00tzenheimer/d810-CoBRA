@@ -24,6 +24,7 @@ assuming which matters more.
 from __future__ import annotations
 
 import dataclasses
+import time
 import uuid
 
 import ida_hexrays
@@ -39,6 +40,7 @@ from d810_cobra.detect import (
     _walk,
 )
 from d810_cobra.escalate import EscalationProver
+from d810_cobra.deferred_solve import DeferredSolver
 from d810_cobra.expr import accept_rewrite, node_count
 from d810_cobra.prove import (
     INLINE_TIMEOUT_MS,
@@ -132,6 +134,12 @@ class CobraSolveRule(PeepholeSimplificationRule):
         self._width_lift_table = RewriteTable()
         self._width_lift_abstentions = CacheImpl(max_size=DEFAULT_MAX_ENTRIES)
         self.escalator = EscalationProver(self.table)
+        self.deferred = DeferredSolver(self.table)
+        self.solve_timeout_ms: int | None = None
+        self.function_solve_budget_ms: int | None = None
+        self.background_solve_timeout_ms = 30_000
+        self._solve_session_stack: list[str] = []
+        self._solve_remaining_ms: dict[str, float] = {}
         # The durable cache is loaded lazily, not here: the manager assigns
         # ``log_dir`` *after* construction, so resolving the path now would
         # silently fall back to the temp directory.
@@ -149,7 +157,43 @@ class CobraSolveRule(PeepholeSimplificationRule):
 
     def stop_escalator(self) -> None:
         """Stop the off-path prover during activation shutdown."""
+        self.deferred.stop()
         self.escalator.stop()
+
+    def begin_decompilation(self, event) -> None:
+        """Open the manager-owned aggregate solve allowance for one session."""
+        session_id = str(getattr(event, "session_id", ""))
+        if not session_id:
+            return
+        self._solve_session_stack.append(session_id)
+        if self.function_solve_budget_ms is not None:
+            self._solve_remaining_ms[session_id] = float(self.function_solve_budget_ms)
+
+    def end_decompilation(self, event) -> None:
+        session_id = str(getattr(event, "session_id", ""))
+        if self._solve_session_stack and self._solve_session_stack[-1] == session_id:
+            self._solve_session_stack.pop()
+            self._solve_remaining_ms.pop(session_id, None)
+
+    def _inline_limit_ms(self) -> int | None:
+        limit = self.solve_timeout_ms
+        if self._solve_session_stack:
+            remaining = self._solve_remaining_ms.get(self._solve_session_stack[-1])
+            if remaining is not None:
+                if remaining < 1:
+                    return 0
+                remaining_whole = int(remaining)
+                limit = min(limit, remaining_whole) if limit is not None else remaining_whole
+        return limit
+
+    def _charge_solve(self, elapsed_ms: float) -> None:
+        if not self._solve_session_stack:
+            return
+        session_id = self._solve_session_stack[-1]
+        if session_id in self._solve_remaining_ms:
+            self._solve_remaining_ms[session_id] = max(
+                0.0, self._solve_remaining_ms[session_id] - elapsed_ms
+            )
 
     def close_store(self) -> None:
         """Close the durable proof cache after its final flush."""
@@ -233,6 +277,19 @@ class CobraSolveRule(PeepholeSimplificationRule):
         super().configure(kwargs)
         self.max_leaves = int(self.config.get("max_leaves", DEFAULT_MAX_LEAVES))
         self.require_proof = bool(self.config.get("require_proof", True))
+        for name in ("solve_timeout_ms", "function_solve_budget_ms",
+                     "background_solve_timeout_ms"):
+            value = self.config.get(name, 30_000 if name == "background_solve_timeout_ms" else 0)
+            if type(value) is not int or not 0 <= value <= 300_000:
+                raise ValueError(f"{name} must be an integer from 0 to 300000")
+            if name == "solve_timeout_ms":
+                self.solve_timeout_ms = value or None
+            elif name == "function_solve_budget_ms":
+                self.function_solve_budget_ms = value or None
+            else:
+                self.background_solve_timeout_ms = value
+        if self.background_solve_timeout_ms:
+            self.deferred.configure_timeout(self.background_solve_timeout_ms)
         # OFF by default, and it must stay that way. Installing runs pip, which
         # needs the network and can take tens of seconds; doing that
         # unprompted while IDA loads a project would freeze the UI for reasons
@@ -265,6 +322,11 @@ class CobraSolveRule(PeepholeSimplificationRule):
         # Only an activated rule gets configured, so this is the first point at
         # which a worker is known to be wanted. start() is idempotent.
         self.escalator.start()
+        if self.background_solve_timeout_ms and (
+            self.solve_timeout_ms is not None
+            or self.function_solve_budget_ms is not None
+        ):
+            self.deferred.start()
 
     def _install_solver_support(self) -> None:
         """Install the solver d810 keeps in ~/.d810-speedups, on explicit opt-in.
@@ -302,6 +364,10 @@ class CobraSolveRule(PeepholeSimplificationRule):
         if self._store_loaded:
             return
         self._store_loaded = True
+        if not self.require_proof:
+            # Proof-disabled results may live in this rule's table, but never
+            # enter the cross-project durable cache.
+            return
         try:
             self._store = ProofCacheStore(
                 proof_cache_db_path(getattr(self, "log_dir", None))
@@ -466,7 +532,14 @@ class CobraSolveRule(PeepholeSimplificationRule):
 
         # --- tier 1: the table. A hit skips BOTH solving and proving. -------
         self._ensure_store()
+        if self.deferred.take_settled():
+            self.flush_store()
         entry = self.table.lookup(candidate.tree, candidate.bitwidth)
+        if (entry is not None and self.require_proof
+                and getattr(entry.outcome, "value", None) == Outcome.PROVED.value
+                and not entry.proof_verified):
+            self.table.clear_unverified(candidate.tree, candidate.bitwidth)
+            entry = None
         if entry is not None:
             outcome = getattr(entry.outcome, "value", None)
             if outcome != Outcome.PROVED.value:
@@ -479,7 +552,7 @@ class CobraSolveRule(PeepholeSimplificationRule):
                     else ProviderOutcomeStatus.UNCHANGED
                 )
                 reason = (
-                    "proof_timeout_escalated"
+                    "background_pending"
                     if outcome == Outcome.PENDING.value
                     else "cached_no_rewrite"
                 )
@@ -488,16 +561,36 @@ class CobraSolveRule(PeepholeSimplificationRule):
             return self._install(candidate, entry.rewrite, ins)
 
         # --- tier 2: solve, then accept, then a BOUNDED proof ---------------
+        limit_ms = self._inline_limit_ms()
+        if limit_ms == 0:
+            queued = self.deferred.submit(
+                candidate.tree, candidate.leaf_names, candidate.bitwidth
+            )
+            self._finish_attempt(
+                ProviderOutcomeStatus.OVER_BUDGET,
+                "solve_budget_deferred" if queued else "solve_budget_retryable",
+            )
+            return None
+        started_at = time.monotonic()
         result = solve_signature(
-            candidate.tree, candidate.leaf_names, candidate.bitwidth
+            candidate.tree, candidate.leaf_names, candidate.bitwidth,
+            time_limit_ms=limit_ms,
         )
+        self._charge_solve((time.monotonic() - started_at) * 1000)
         if getattr(result.status, "value", None) != SolveStatus.SOLVED.value \
                 or result.tree is None:
-            # Negative caching is what stops this candidate being re-solved on
-            # every pass; 46 of 60 measured candidates end here.
-            self.table.record_no_rewrite(candidate.tree, candidate.bitwidth)
-            self._record_and_maybe_flush()
-            if getattr(result.status, "value", None) == SolveStatus.UNCHANGED.value:
+            result_status = getattr(result.status, "value", None)
+            if result_status == SolveStatus.EXPIRED.value or result.expired:
+                queued = self.deferred.submit(
+                    candidate.tree, candidate.leaf_names, candidate.bitwidth
+                )
+                self._finish_attempt(
+                    ProviderOutcomeStatus.OVER_BUDGET,
+                    "solve_timeout_deferred" if queued else "solve_timeout_retryable",
+                )
+            elif result_status == SolveStatus.UNCHANGED.value:
+                self.table.record_no_rewrite(candidate.tree, candidate.bitwidth)
+                self._record_and_maybe_flush()
                 self._finish_attempt(ProviderOutcomeStatus.UNCHANGED, "no_rewrite")
             else:
                 self._finish_attempt(ProviderOutcomeStatus.ERROR, "solver_failed")
@@ -505,9 +598,18 @@ class CobraSolveRule(PeepholeSimplificationRule):
         # Accept before proving: a rejected rewrite is never used, so proving
         # it first is pure waste.
         if not accept_rewrite(candidate.tree, result.tree):
-            self.table.record_no_rewrite(candidate.tree, candidate.bitwidth)
-            self._record_and_maybe_flush()
-            self._finish_attempt(ProviderOutcomeStatus.UNCHANGED, "accept_refused")
+            if result.expired:
+                queued = self.deferred.submit(
+                    candidate.tree, candidate.leaf_names, candidate.bitwidth
+                )
+                self._finish_attempt(
+                    ProviderOutcomeStatus.OVER_BUDGET,
+                    "solve_timeout_deferred" if queued else "solve_timeout_retryable",
+                )
+            else:
+                self.table.record_no_rewrite(candidate.tree, candidate.bitwidth)
+                self._record_and_maybe_flush()
+                self._finish_attempt(ProviderOutcomeStatus.UNCHANGED, "accept_refused")
             return None
 
         if self.require_proof:
@@ -551,7 +653,10 @@ class CobraSolveRule(PeepholeSimplificationRule):
                 )
                 return None
 
-        self.table.record_proved(candidate.tree, candidate.bitwidth, result.tree)
+        self.table.record_proved(
+            candidate.tree, candidate.bitwidth, result.tree,
+            proof_verified=self.require_proof,
+        )
         self._record_and_maybe_flush()
         return self._install(candidate, result.tree, ins)
 
@@ -570,7 +675,26 @@ class CobraSolveRule(PeepholeSimplificationRule):
                 return self._install(candidate, entry.rewrite, ins, proof_verified=True)
             self._finish_attempt(ProviderOutcomeStatus.UNCHANGED, 'width_cached_no_rewrite')
             return None
-        result = solve_signature(candidate.tree, candidate.leaf_names, candidate.bitwidth)
+        limit_ms = self._inline_limit_ms()
+        if limit_ms == 0:
+            self._finish_attempt(ProviderOutcomeStatus.OVER_BUDGET, 'width_solve_budget')
+            return None
+        started_at = time.monotonic()
+        result = solve_signature(
+            candidate.tree, candidate.leaf_names, candidate.bitwidth,
+            time_limit_ms=limit_ms,
+        )
+        self._charge_solve((time.monotonic() - started_at) * 1000)
+        if getattr(result.status, 'value', None) == SolveStatus.EXPIRED.value:
+            self._finish_attempt(ProviderOutcomeStatus.OVER_BUDGET, 'width_solve_timeout')
+            return None
+        if result.expired and (
+            getattr(result.status, 'value', None) != SolveStatus.SOLVED.value
+            or result.tree is None
+            or not accept_rewrite(candidate.tree, result.tree)
+        ):
+            self._finish_attempt(ProviderOutcomeStatus.OVER_BUDGET, 'width_solve_timeout')
+            return None
         if (getattr(result.status, 'value', None) == SolveStatus.FAILED.value
                 or (getattr(result.status, 'value', None) == SolveStatus.SOLVED.value
                     and result.tree is None)):
@@ -597,7 +721,9 @@ class CobraSolveRule(PeepholeSimplificationRule):
             self._width_lift_abstentions[key] = (status, reason)
             self._finish_attempt(status, reason)
             return None
-        table.record_proved(candidate.tree, candidate.bitwidth, result.tree)
+        table.record_proved(
+            candidate.tree, candidate.bitwidth, result.tree, proof_verified=True
+        )
         return self._install(candidate, result.tree, ins, proof_verified=True)
 
     def _install(self, candidate, rewrite, ins, *, proof_verified=False):

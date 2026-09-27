@@ -64,6 +64,7 @@ class Outcome(enum.Enum):
 class Entry:
     outcome: Outcome
     rewrite: dict | None = None
+    proof_verified: bool = False
 
 
 @dataclasses.dataclass
@@ -234,17 +235,36 @@ class RewriteTable:
             else:
                 self.stats.pending_hits += 1
         if entry.outcome is Outcome.PROVED and entry.rewrite is not None:
-            return Entry(Outcome.PROVED, _instantiate(entry.rewrite, order))
+            return Entry(Outcome.PROVED, _instantiate(entry.rewrite, order),
+                         entry.proof_verified)
         return entry
 
     def record_proved(
-        self, tree: Mapping[str, Any], bitwidth: int, rewrite: dict
+        self, tree: Mapping[str, Any], bitwidth: int, rewrite: dict,
+        *, proof_verified: bool = False,
     ) -> None:
         names: dict[str, int] = {}
         key = (bitwidth, _canon(tree, names))
         positional = _to_positional(rewrite, names)
         with self._lock:
-            self._entries[key] = Entry(Outcome.PROVED, positional)
+            self._entries[key] = Entry(Outcome.PROVED, positional, proof_verified)
+
+    def clear_pending(self, tree: Mapping[str, Any], bitwidth: int) -> None:
+        """Release an unfinished attempt so a later budget can retry it."""
+        key = canonical_key(tree, bitwidth)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry.outcome is Outcome.PENDING:
+                self._entries.pop(key, None)
+
+    def clear_unverified(self, tree: Mapping[str, Any], bitwidth: int) -> None:
+        """Drop a proof-disabled result before a proof-required activation."""
+        key = canonical_key(tree, bitwidth)
+        with self._lock:
+            entry = self._entries.get(key)
+            if (entry is not None and entry.outcome is Outcome.PROVED
+                    and not entry.proof_verified):
+                self._entries.pop(key, None)
 
     def record_no_rewrite(self, tree: Mapping[str, Any], bitwidth: int) -> None:
         key = canonical_key(tree, bitwidth)
@@ -271,6 +291,8 @@ class RewriteTable:
         killed session look like it still had escalated work outstanding,
         permanently suppressing those candidates on every future run.
         """
+        with self._lock:
+            settled = tuple(self._entries.items())
         return {
             "version": 1,
             "entries": [
@@ -278,8 +300,9 @@ class RewriteTable:
                     "key": _key_to_json(key),
                     "outcome": entry.outcome.value,
                     "rewrite": entry.rewrite,
+                    "proof_verified": entry.proof_verified,
                 }
-                for key, entry in self._entries.items()
+                for key, entry in settled
                 if entry.outcome is not Outcome.PENDING
             ],
         }
@@ -292,7 +315,7 @@ class RewriteTable:
             if outcome is Outcome.PENDING:
                 continue
             table._entries[_key_from_json(raw["key"])] = Entry(
-                outcome, raw.get("rewrite")
+                outcome, raw.get("rewrite"), raw.get("proof_verified") is True
             )
         return table
 

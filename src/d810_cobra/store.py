@@ -37,14 +37,15 @@ logger = getLogger(__name__)
 #: Bump when the on-disk row shape changes. Rows carrying a different version
 #: are ignored rather than misread -- a stale schema silently reinterpreted is
 #: how a cache turns into a correctness bug.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _CREATE = """
-CREATE TABLE IF NOT EXISTS cobra_proofs (
+CREATE TABLE IF NOT EXISTS cobra_proofs_v2 (
     key            TEXT PRIMARY KEY,
     schema_version INTEGER NOT NULL,
     outcome        TEXT NOT NULL,
-    rewrite_json   TEXT
+    rewrite_json   TEXT,
+    proof_verified INTEGER NOT NULL
 )
 """
 
@@ -105,7 +106,7 @@ class ProofCacheStore:
             return table
         try:
             rows = conn.execute(
-                "SELECT key, outcome, rewrite_json FROM cobra_proofs "
+                "SELECT key, outcome, rewrite_json, proof_verified FROM cobra_proofs_v2 "
                 "WHERE schema_version = ?",
                 (SCHEMA_VERSION,),
             ).fetchall()
@@ -114,8 +115,10 @@ class ProofCacheStore:
             return table
 
         entries = []
-        for key_json, outcome, rewrite_json in rows:
+        for key_json, outcome, rewrite_json, proof_verified in rows:
             try:
+                if outcome == Outcome.PROVED.value and proof_verified != 1:
+                    continue
                 entries.append(
                     {
                         "key": json.loads(key_json),
@@ -123,6 +126,7 @@ class ProofCacheStore:
                         "rewrite": (
                             json.loads(rewrite_json) if rewrite_json else None
                         ),
+                        "proof_verified": proof_verified == 1,
                     }
                 )
             except (json.JSONDecodeError, TypeError):
@@ -147,18 +151,22 @@ class ProofCacheStore:
         outcome = getattr(entry.outcome, "value", None)
         if outcome is None or outcome == Outcome.PENDING.value:
             return
+        if outcome == Outcome.PROVED.value and entry.proof_verified is not True:
+            return
         conn = self._connect()
         if conn is None:
             return
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO cobra_proofs "
-                "(key, schema_version, outcome, rewrite_json) VALUES (?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO cobra_proofs_v2 "
+                "(key, schema_version, outcome, rewrite_json, proof_verified) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (
                     json.dumps(_key_to_json(key)),
                     SCHEMA_VERSION,
                     outcome,
                     json.dumps(entry.rewrite) if entry.rewrite else None,
+                    int(entry.proof_verified),
                 ),
             )
             conn.commit()
@@ -182,16 +190,20 @@ class ProofCacheStore:
                 SCHEMA_VERSION,
                 entry["outcome"],
                 json.dumps(entry["rewrite"]) if entry["rewrite"] else None,
+                int(entry["proof_verified"]),
             )
             for entry in payload["entries"]
             if entry["outcome"] != Outcome.PENDING.value
+            and (entry["outcome"] != Outcome.PROVED.value
+                 or entry["proof_verified"] is True)
         ]
         if not rows:
             return 0
         try:
             conn.executemany(
-                "INSERT OR REPLACE INTO cobra_proofs "
-                "(key, schema_version, outcome, rewrite_json) VALUES (?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO cobra_proofs_v2 "
+                "(key, schema_version, outcome, rewrite_json, proof_verified) "
+                "VALUES (?, ?, ?, ?, ?)",
                 rows,
             )
             conn.commit()

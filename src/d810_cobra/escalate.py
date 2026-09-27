@@ -217,17 +217,21 @@ class EscalationProver:
             **kwargs,
         )
         if getattr(verdict, "value", None) == ProofResult.PROVED.value:
-            self._table.record_proved(original, bitwidth, rewrite)
+            self._table.record_proved(
+                original, bitwidth, rewrite, proof_verified=True
+            )
             return
         if self._stopping.is_set():
             # Shutdown interrupts are incomplete proofs, not evidence that a
             # candidate has no valid rewrite.  Keep the in-flight table entry
             # PENDING; pending entries are intentionally non-serializable.
             return
-        # REFUTED and UNKNOWN both settle to NO_REWRITE. UNKNOWN here means the
-        # generous budget also gave up, so re-queueing it every decompile would
-        # never converge -- record it and stop asking.
-        self._table.record_no_rewrite(original, bitwidth)
+        if getattr(verdict, "value", None) == ProofResult.REFUTED.value:
+            self._table.record_no_rewrite(original, bitwidth)
+        else:
+            # A proof deadline or unavailable prover cannot establish a
+            # permanent negative result. A later budget may succeed.
+            self._table.clear_pending(original, bitwidth)
 
 
 __all__ = ["DEFAULT_MAX_QUEUE", "EscalationProver"]

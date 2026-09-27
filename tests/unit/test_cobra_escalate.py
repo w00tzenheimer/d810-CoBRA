@@ -71,12 +71,8 @@ class TestEscalationProver(unittest.TestCase):
         prover.stop()
         self.assertEqual(self.table.lookup(TREE, 32).outcome, Outcome.NO_REWRITE)
 
-    def test_unknown_after_the_long_budget_is_recorded_as_no_rewrite(self):
-        """If the generous budget also times out, stop asking.
-
-        Leaving it PENDING forever would re-queue the same candidate on every
-        decompile and never converge.
-        """
+    def test_unknown_after_the_long_budget_remains_retryable(self):
+        """An inconclusive proof must not become a permanent negative cache entry."""
         prover = EscalationProver(
             self.table, prover=lambda *a, **k: ProofResult.UNKNOWN
         )
@@ -84,7 +80,7 @@ class TestEscalationProver(unittest.TestCase):
         prover.submit(TREE, 32, REWRITE, ["a", "b"])
         prover.drain()
         prover.stop()
-        self.assertEqual(self.table.lookup(TREE, 32).outcome, Outcome.NO_REWRITE)
+        self.assertIsNone(self.table.lookup(TREE, 32))
 
     def test_submit_marks_pending_immediately(self):
         """Between submit and completion the entry must read PENDING.

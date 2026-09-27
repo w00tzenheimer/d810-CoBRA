@@ -26,8 +26,8 @@ DEFAULT_TIMEOUT_SECONDS = 180
 try:  # the in-process binding is built only when D810_BUILD_COBRA=1
     from d810_cobra import _cobra
 
-    _BINDING_AVAILABLE = True
-    _BINDING_ERROR = ""
+    _BINDING_AVAILABLE = hasattr(_cobra, "simplify_budgeted")
+    _BINDING_ERROR = "" if _BINDING_AVAILABLE else "native CoBRA binding needs rebuilding"
 except ImportError as exc:  # pragma: no cover - depends on build configuration
     _cobra = None  # type: ignore[assignment]
     _BINDING_AVAILABLE = False
@@ -40,6 +40,7 @@ except ImportError as exc:  # pragma: no cover - depends on build configuration
 class SolveStatus(enum.Enum):
     SOLVED = "solved"
     UNCHANGED = "unchanged"
+    EXPIRED = "expired"
     FAILED = "failed"
 
 
@@ -49,6 +50,7 @@ class SolveResult:
     tree: dict | None = None
     raw_output: str = ""
     reason: str = ""
+    expired: bool = False
 
     @property
     def solved(self) -> bool:
@@ -83,6 +85,8 @@ def solve_signature(
     bitwidth: int,
     *,
     max_vars: int = 16,
+    time_limit_ms: int | None = None,
+    max_weighted_size: int | None = None,
 ) -> SolveResult:
     """Solve *tree* in-process via the Cython binding.
 
@@ -106,8 +110,9 @@ def solve_signature(
         return SolveResult(SolveStatus.FAILED, reason=f"could not evaluate: {exc}")
 
     try:
-        solved = _cobra.simplify(
-            signature, list(leaf_names), bitwidth, tree, max_vars
+        solved, expired = _cobra.simplify_budgeted(
+            signature, list(leaf_names), bitwidth, tree, max_vars,
+            time_limit_ms, max_weighted_size,
         )
     except ValueError as exc:
         return SolveResult(SolveStatus.FAILED, reason=str(exc))
@@ -116,10 +121,12 @@ def solve_signature(
         return SolveResult(SolveStatus.FAILED, reason=str(exc))
 
     if solved is None:
-        return SolveResult(SolveStatus.UNCHANGED)
+        return SolveResult(SolveStatus.EXPIRED if expired else SolveStatus.UNCHANGED,
+                           expired=expired)
     if solved == tree:
-        return SolveResult(SolveStatus.UNCHANGED)
-    return SolveResult(SolveStatus.SOLVED, tree=solved)
+        return SolveResult(SolveStatus.EXPIRED if expired else SolveStatus.UNCHANGED,
+                           expired=expired)
+    return SolveResult(SolveStatus.SOLVED, tree=solved, expired=expired)
 
 
 def solve_expression(

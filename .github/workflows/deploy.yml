@@ -1,4 +1,4 @@
-# Build wheels for every supported platform and publish to PyPI.
+# Build wheels for every supported platform and publish a version-tagged release.
 #
 # The filename matters: the PyPI Trusted Publisher for d810-cobra is
 # registered against `deploy.yml` on this repository. Renaming this file breaks
@@ -6,8 +6,8 @@
 name: deploy
 
 on:
-    release:
-        types: [published]
+    push:
+        tags: ["v*"]
     workflow_dispatch:
         inputs:
             publish:
@@ -140,7 +140,7 @@ jobs:
     publish:
         needs: [build_wheels, build_sdist]
         runs-on: ubuntu-latest
-        if: github.event_name == 'release' || inputs.publish
+        if: github.event_name == 'push' || inputs.publish
         # No `environment:` on purpose. The PyPI Trusted Publisher for this
         # project is registered WITHOUT an environment, and the environment is
         # part of what PyPI matches the OIDC token against. Declaring one here
@@ -156,24 +156,37 @@ jobs:
             # upload fails on permissions, not on credentials.
             id-token: write
         steps:
+            - uses: actions/checkout@v4
+            - name: Match release tag to package version
+              if: github.event_name == 'push'
+              run: |
+                  python - <<'PY'
+                  import os
+                  import tomllib
+                  from pathlib import Path
+
+                  version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+                  tag = os.environ["GITHUB_REF_NAME"]
+                  if tag != f"v{version}":
+                      raise SystemExit(f"release tag {tag} does not match package {version}")
+                  PY
             - uses: actions/download-artifact@v4
               with:
                   path: dist
                   merge-multiple: true
             - uses: pypa/gh-action-pypi-publish@release/v1
 
-    # Attach the same artifacts to the GitHub release. Without this the release
+    # Create the GitHub release and attach the same artifacts. Without this the release
     # page lists no files at all and the wheels are findable only on PyPI, which
     # read as "no Windows wheel" to someone looking at the release.
     #
-    # A separate job, not a step in `publish`, for two reasons. `publish` must
-    # keep exactly `id-token: write` -- widening its permissions is not needed
-    # for the upload -- and a failure here must not block the PyPI upload,
-    # which is the release of record.
+    # A separate job, not a step in `publish`: PyPI uses only OIDC permissions,
+    # while creating the GitHub release requires contents: write. Wait for
+    # PyPI so GitHub never advertises assets before the release of record exists.
     release_assets:
-        needs: [build_wheels, build_sdist]
+        needs: [build_wheels, build_sdist, publish]
         runs-on: ubuntu-latest
-        if: github.event_name == 'release'
+        if: github.event_name == 'push'
         permissions:
             contents: write
         steps:
@@ -189,6 +202,9 @@ jobs:
             - name: Upload to release
               env:
                   GH_TOKEN: ${{ github.token }}
-              run: >-
-                  gh release upload "${{ github.event.release.tag_name }}"
-                  dist/* --clobber --repo "${{ github.repository }}"
+              run: |
+                  gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+                    gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+                      --repo "$GITHUB_REPOSITORY"
+                  gh release upload "$GITHUB_REF_NAME" dist/* --clobber \
+                    --repo "$GITHUB_REPOSITORY"

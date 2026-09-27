@@ -19,8 +19,9 @@ style choice: the IDA SDK does not compile as C++23 (``pro.h`` uses
 stays on the Python side in ``detect.py`` / ``convert.py``.
 """
 
-from libc.stdint cimport int32_t, uint32_t, uint64_t
+from libc.stdint cimport int32_t, int64_t, uint8_t, uint32_t, uint64_t
 from libc.stdlib cimport free, malloc
+import time
 
 cdef extern from "cobra_shim.h" nogil:
     ctypedef struct cobra_node_t:
@@ -32,10 +33,11 @@ cdef extern from "cobra_shim.h" nogil:
 
     int cobra_shim_simplify(const uint64_t *sig, size_t sig_len, uint32_t nvars,
                             uint32_t bitwidth, uint32_t max_vars,
+                            int64_t time_limit_ms, int64_t max_weighted_size,
                             const cobra_node_t *in_nodes, size_t in_len,
                             int32_t in_root, cobra_node_t *out_nodes,
                             size_t out_cap, size_t *out_len, int32_t *out_root,
-                            char *err, size_t err_cap)
+                            uint8_t *time_limit_reached, char *err, size_t err_cap)
 
     int COBRA_OK
     int COBRA_UNCHANGED
@@ -166,15 +168,16 @@ cdef object _build(cobra_node_t *nodes, int32_t index, list varnames):
     raise CobraSolverError(f"unknown node kind {kind}")
 
 
-def simplify(signature, varnames, unsigned int bitwidth, tree,
-             unsigned int max_vars=16):
+def simplify_budgeted(signature, varnames, unsigned int bitwidth, tree,
+                      unsigned int max_vars=16, time_limit_ms=None,
+                      max_weighted_size=None):
     """Return the simplest expression CoBRA finds for *signature*.
 
     ``signature`` must hold ``1 << len(varnames)`` entries: the expression
     evaluated at every 0/1 assignment of its leaves.
 
-    Returns ``None`` only when CoBRA reports ``kUnchangedUnsupported`` -- that
-    is, it could not handle the input at all.
+    Returns ``(tree_or_none, time_limit_reached)``. Expiry remains visible even
+    when CoBRA found a candidate before its final pass crossed the deadline.
 
     **A returned tree is not necessarily different from the caller's original.**
     The solver is given a *signature*, not an expression, so "unchanged" is not
@@ -194,6 +197,18 @@ def simplify(signature, varnames, unsigned int bitwidth, tree,
         )
     if bitwidth not in (8, 16, 32, 64):
         raise ValueError(f"unsupported bitwidth {bitwidth}")
+    cdef int64_t native_time_limit = -1
+    cdef int64_t native_max_cost = -1
+    cdef int64_t remaining_ms
+    if time_limit_ms is not None:
+        if type(time_limit_ms) is not int or not 0 <= time_limit_ms <= 0xFFFFFFFF:
+            raise ValueError("time_limit_ms must be a nonnegative 32-bit integer")
+        native_time_limit = time_limit_ms
+    if max_weighted_size is not None:
+        if (type(max_weighted_size) is not int
+                or not 1 <= max_weighted_size <= 0xFFFFFFFF):
+            raise ValueError("max_weighted_size must be a positive 32-bit integer")
+        native_max_cost = max_weighted_size
 
     # Flatten the ORIGINAL expression: without it Simplify loses its
     # evaluator, its cost baseline and the XOR fallback (see cobra_shim.h).
@@ -212,8 +227,10 @@ def simplify(signature, varnames, unsigned int bitwidth, tree,
     cdef size_t err_cap = _ERROR_CAPACITY
     cdef size_t produced = 0
     cdef int32_t root = -1
+    cdef uint8_t expired = 0
     cdef int status
     cdef size_t i
+    cdef double started_at = 0.0
 
     if sig == NULL or err == NULL or in_nodes == NULL:
         free(sig)
@@ -237,13 +254,21 @@ def simplify(signature, varnames, unsigned int bitwidth, tree,
             raise MemoryError("could not allocate node buffer")
 
         # The solve is the expensive part and touches no Python state.
+        if time_limit_ms is not None:
+            started_at = time.monotonic()
         with nogil:
             status = cobra_shim_simplify(sig, sig_len, nvars, bitwidth,
-                                         max_vars, in_nodes, in_len, in_root,
+                                         max_vars, native_time_limit, native_max_cost,
+                                         in_nodes, in_len, in_root,
                                          nodes, capacity, &produced, &root,
-                                         err, err_cap)
+                                         &expired, err, err_cap)
 
         if status == COBRA_TOO_SMALL:
+            if time_limit_ms is not None:
+                remaining_ms = int(time_limit_ms - (time.monotonic() - started_at) * 1000)
+                if remaining_ms <= 0:
+                    return (None, True)
+                native_time_limit = remaining_ms
             # Grow once to exactly what the solver asked for and retry.
             capacity = produced
             free(nodes)
@@ -252,12 +277,13 @@ def simplify(signature, varnames, unsigned int bitwidth, tree,
                 raise MemoryError("could not allocate node buffer")
             with nogil:
                 status = cobra_shim_simplify(sig, sig_len, nvars, bitwidth,
-                                             max_vars, in_nodes, in_len,
+                                             max_vars, native_time_limit,
+                                             native_max_cost, in_nodes, in_len,
                                              in_root, nodes, capacity,
-                                             &produced, &root, err, err_cap)
+                                             &produced, &root, &expired, err, err_cap)
 
         if status == COBRA_UNCHANGED:
-            return None
+            return (None, bool(expired))
         if status != COBRA_OK:
             raise CobraSolverError(
                 (err.decode("utf-8", "replace") or "solver failed")
@@ -266,9 +292,15 @@ def simplify(signature, varnames, unsigned int bitwidth, tree,
         if root < 0 or <size_t>root >= produced:
             raise CobraSolverError("solver returned an invalid root index")
 
-        return _build(nodes, root, names)
+        return (_build(nodes, root, names), bool(expired))
     finally:
         free(sig)
         free(nodes)
         free(err)
         free(in_nodes)
+
+
+def simplify(signature, varnames, unsigned int bitwidth, tree,
+             unsigned int max_vars=16):
+    """Compatibility API for callers that do not request solver budgets."""
+    return simplify_budgeted(signature, varnames, bitwidth, tree, max_vars)[0]

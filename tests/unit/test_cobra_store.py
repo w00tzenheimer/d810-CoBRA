@@ -54,7 +54,7 @@ class TestRoundTrip(unittest.TestCase):
 
     def test_proved_entry_survives_a_new_process_equivalent(self):
         table = RewriteTable()
-        table.record_proved(TREE, 32, REWRITE)
+        table.record_proved(TREE, 32, REWRITE, proof_verified=True)
 
         store = ProofCacheStore(self.db)
         store.flush(table)
@@ -92,7 +92,7 @@ class TestRoundTrip(unittest.TestCase):
     def test_reloaded_rewrite_is_bound_to_the_querying_leaves(self):
         """Persistence must not lose the positional-instantiation contract."""
         table = RewriteTable()
-        table.record_proved(TREE, 32, REWRITE)
+        table.record_proved(TREE, 32, REWRITE, proof_verified=True)
         store = ProofCacheStore(self.db)
         store.flush(table)
         store.close()
@@ -104,7 +104,7 @@ class TestRoundTrip(unittest.TestCase):
 
     def test_flush_is_idempotent(self):
         table = RewriteTable()
-        table.record_proved(TREE, 32, REWRITE)
+        table.record_proved(TREE, 32, REWRITE, proof_verified=True)
         store = ProofCacheStore(self.db)
         store.flush(table)
         store.flush(table)
@@ -114,7 +114,7 @@ class TestRoundTrip(unittest.TestCase):
     def test_second_session_accumulates_rather_than_replaces(self):
         """Two databases analysed in sequence must both contribute."""
         first = RewriteTable()
-        first.record_proved(TREE, 32, REWRITE)
+        first.record_proved(TREE, 32, REWRITE, proof_verified=True)
         s = ProofCacheStore(self.db)
         s.flush(first)
         s.close()
@@ -143,14 +143,14 @@ class TestRoundTrip(unittest.TestCase):
     def test_schema_version_mismatch_is_ignored_not_misread(self):
         store = ProofCacheStore(self.db)
         table = RewriteTable()
-        table.record_proved(TREE, 32, REWRITE)
+        table.record_proved(TREE, 32, REWRITE, proof_verified=True)
         store.flush(table)
         store.close()
 
         import sqlite3
 
         conn = sqlite3.connect(self.db)
-        conn.execute("UPDATE cobra_proofs SET schema_version = 999")
+        conn.execute("UPDATE cobra_proofs_v2 SET schema_version = 999")
         conn.commit()
         conn.close()
 
@@ -181,7 +181,7 @@ class TestSingleEntryWrite(unittest.TestCase):
 
         store = ProofCacheStore(self.db)
         key = canonical_key(TREE, 32)
-        store.put_entry(key, Entry(Outcome.PROVED, {"kind": "var", "name": "@0"}))
+        store.put_entry(key, Entry(Outcome.PROVED, {"kind": "var", "name": "@0"}, proof_verified=True))
         store.close()
 
         restored = ProofCacheStore(self.db).load()
@@ -215,7 +215,7 @@ class TestSingleEntryWrite(unittest.TestCase):
 
         store = ProofCacheStore(self.db)
         table = RewriteTable(max_size=2, on_evict=store.put_entry)
-        table.record_proved(TREE, 32, B("+", V("a"), V("b")))
+        table.record_proved(TREE, 32, B("+", V("a"), V("b")), proof_verified=True)
         for i in range(12):
             table.record_no_rewrite(B("^", V("a"), C(i)), 32)
         store.close()

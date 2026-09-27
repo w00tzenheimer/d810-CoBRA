@@ -78,10 +78,11 @@ typedef struct {
  */
 int cobra_shim_simplify(const uint64_t *sig, size_t sig_len, uint32_t nvars,
                         uint32_t bitwidth, uint32_t max_vars,
+                        int64_t time_limit_ms, int64_t max_weighted_size,
                         const cobra_node_t *in_nodes, size_t in_len,
                         int32_t in_root, cobra_node_t *out_nodes,
                         size_t out_cap, size_t *out_len, int32_t *out_root,
-                        char *err, size_t err_cap);
+                        uint8_t *time_limit_reached, char *err, size_t err_cap);
 
 #ifdef __cplusplus
 }

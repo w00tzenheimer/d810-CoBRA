@@ -14,6 +14,7 @@
 #include <cobra/core/Simplifier.h>
 
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -146,13 +147,23 @@ void copy_error(char *err, size_t err_cap, const std::string &message) {
 
 int cobra_shim_simplify(const uint64_t *sig, size_t sig_len, uint32_t nvars,
                         uint32_t bitwidth, uint32_t max_vars,
+                        int64_t time_limit_ms, int64_t max_weighted_size,
                         const cobra_node_t *in_nodes, size_t in_len,
                         int32_t in_root, cobra_node_t *out_nodes,
                         size_t out_cap, size_t *out_len, int32_t *out_root,
-                        char *err, size_t err_cap) {
+                        uint8_t *time_limit_reached, char *err, size_t err_cap) {
   try {
-    if (sig == nullptr || out_len == nullptr || out_root == nullptr) {
+    if (sig == nullptr || out_len == nullptr || out_root == nullptr ||
+        time_limit_reached == nullptr) {
       copy_error(err, err_cap, "null argument");
+      return COBRA_ERROR;
+    }
+    *time_limit_reached = 0;
+    if (time_limit_ms < -1 || max_weighted_size < -1 ||
+        time_limit_ms > std::numeric_limits<uint32_t>::max() ||
+        max_weighted_size > std::numeric_limits<uint32_t>::max() ||
+        max_weighted_size == 0) {
+      copy_error(err, err_cap, "invalid solver budget");
       return COBRA_ERROR;
     }
     if (in_nodes == nullptr || in_len == 0) {
@@ -175,6 +186,12 @@ int cobra_shim_simplify(const uint64_t *sig, size_t sig_len, uint32_t nvars,
     cobra::Options options;
     options.bitwidth = bitwidth;
     options.max_vars = max_vars;
+    if (time_limit_ms >= 0) {
+      options.time_limit_ms = static_cast<uint32_t>(time_limit_ms);
+    }
+    if (max_weighted_size > 0) {
+      options.max_weighted_size = static_cast<uint32_t>(max_weighted_size);
+    }
 
     /* The input expression is what gives Simplify an evaluator, a cost
      * baseline and the XOR fallback. Passing nullptr compiles and runs, but
@@ -192,6 +209,7 @@ int cobra_shim_simplify(const uint64_t *sig, size_t sig_len, uint32_t nvars,
     }
 
     const cobra::SimplifyOutcome &outcome = result.value();
+    *time_limit_reached = outcome.telemetry.time_limit_reached ? 1 : 0;
     if (outcome.kind != cobra::SimplifyOutcome::Kind::kSimplified ||
         outcome.expr == nullptr) {
       return COBRA_UNCHANGED;

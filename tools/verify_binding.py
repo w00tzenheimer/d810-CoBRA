@@ -58,6 +58,16 @@ def main() -> int:
         print(f"FAIL: (x|y)-(x&y) should solve to x^y, got {result}", file=sys.stderr)
         return 1
 
+    budgeted, expired = _cobra.simplify_budgeted(
+        signature, ["x", "y"], 64, tree, time_limit_ms=1000
+    )
+    if budgeted != result or not isinstance(expired, bool):
+        print(
+            f"FAIL: budgeted binding returned {budgeted!r}, expired={expired!r}",
+            file=sys.stderr,
+        )
+        return 1
+
     print("solved: (x|y) - (x&y) -> x ^ y")
     return 0
 
