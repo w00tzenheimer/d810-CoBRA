@@ -123,6 +123,19 @@ jobs:
             - uses: actions/checkout@v4
               with:
                   submodules: recursive
+            - name: Match release tag to package version
+              if: github.event_name == 'push'
+              run: |
+                  python - <<'PY'
+                  import os
+                  import tomllib
+                  from pathlib import Path
+
+                  version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+                  tag = os.environ["GITHUB_REF_NAME"]
+                  if tag != f"v{version}":
+                      raise SystemExit(f"release tag {tag} does not match package {version}")
+                  PY
             # An sdist packs sources; it compiles nothing, so this job
             # deliberately has no CoBRA build step. setuptools nonetheless
             # evaluates ext_modules on every PEP 517 hook, so setup.py needs to
@@ -156,20 +169,6 @@ jobs:
             # upload fails on permissions, not on credentials.
             id-token: write
         steps:
-            - uses: actions/checkout@v4
-            - name: Match release tag to package version
-              if: github.event_name == 'push'
-              run: |
-                  python - <<'PY'
-                  import os
-                  import tomllib
-                  from pathlib import Path
-
-                  version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
-                  tag = os.environ["GITHUB_REF_NAME"]
-                  if tag != f"v{version}":
-                      raise SystemExit(f"release tag {tag} does not match package {version}")
-                  PY
             - uses: actions/download-artifact@v4
               with:
                   path: dist

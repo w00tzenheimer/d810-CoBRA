@@ -102,6 +102,8 @@ class CobraSolveRule(PeepholeSimplificationRule):
     DESCRIPTION = "Solve MBA expressions with CoBRA (proof-gated)"
     CATEGORY = "MBA Solving"
 
+    supports_solve_budgets = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # MMAT_GLBOPT2 only. Measured end-to-end on VM_DecryptPacket:
